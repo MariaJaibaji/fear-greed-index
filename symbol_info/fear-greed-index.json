@@ -1,0 +1,17 @@
+ 
+{
+  "symbols": {
+    "FEAR_GREED_DATA/FG_INDEX": {
+      "name": "Fear & Greed Index",
+      "type": "economic",
+      "exchange": "CNN",
+      "currency": "USD",
+      "description": "CNN Fear & Greed Index",
+      "sector": "Market Sentiment",
+      "timezone": "America/New_York",
+      "has_intraday": false,
+      "has_daily": true,
+      "has_weekly_and_monthly": true
+    }
+  }
+}

@@ -1,7 +1,5 @@
-*.log
-*.tmp
-__pycache__/
-.DS_Store
-*.bak
-*.swp
-AppData/
+*.log 
+AppData/ 
+OneDrive/ 
+*.tmp 
+__pycache__/ 

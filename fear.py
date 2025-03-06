@@ -48,7 +48,7 @@ def update_github(timestamp, index_value):
         os.makedirs(folder_path)
 
     # 2️⃣ Save CSV inside `fear_greed_data/`
-    filename = os.path.join(folder_path, "fear_greed_data.csv")
+    filename = os.path.join(folder_path, "fg_index.csv")
 
     # 3️⃣ Append new data if file exists, otherwise create a new file
     file_exists = os.path.isfile(filename)

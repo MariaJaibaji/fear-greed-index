@@ -54,14 +54,27 @@ def update_github(date, index_value):
     
     print(f"✅ Updated {filename} with Fear & Greed Index: {index_value}")
 
-    # 3️⃣ Push to GitHub
+    # 3️⃣ Ensure Git recognizes the file change
+    subprocess.run(["git", "add", "-u"], check=True)  # Track file updates
+
+    # 4️⃣ Force Git to always create a commit, even if nothing changed
     try:
-        subprocess.run(["git", "add", "."], check=True)
-        subprocess.run(["git", "commit", "-m", f"Updated Fear & Greed Index: {index_value}"], check=True)
+        subprocess.run(["git", "commit", "--allow-empty", "-m", f"Updated Fear & Greed Index: {index_value}"], check=True)
+    except subprocess.CalledProcessError:
+        print("⚠ No new changes to commit, but proceeding with push.")
+
+    # 5️⃣ Push to GitHub with retry logic
+    try:
         subprocess.run(["git", "push", "origin", "main"], check=True)
         print("✅ Pushed updated data to GitHub.")
     except subprocess.CalledProcessError as e:
-        print("❌ Error pushing to GitHub:", e)
+        print("❌ Error pushing to GitHub, retrying...")
+        time.sleep(5)  # Wait before retrying
+        try:
+            subprocess.run(["git", "push", "origin", "main", "--force"], check=True)
+            print("✅ Successfully pushed after retry.")
+        except subprocess.CalledProcessError as e:
+            print("❌ Failed to push after retry:", e)
 
 if __name__ == "__main__":
     date, index_value = get_fear_greed_index()

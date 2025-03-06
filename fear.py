@@ -40,15 +40,15 @@ def get_fear_greed_index():
         return None, None
 
 def update_github(timestamp, index_value):
-    """Updates fear_greed_data/fg_index.csv and pushes to GitHub"""
+    """Updates fear_greed_data/fg_index.txt and pushes to GitHub"""
     
     # 1️⃣ Ensure `fear_greed_data/` folder exists
     folder_path = "fear_greed_data"
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
 
-    # 2️⃣ Save CSV inside `fear_greed_data/`
-    filename = os.path.join(folder_path, "fg_index.csv")
+    # 2️⃣ Save file inside `fear_greed_data/`
+    filename = os.path.join(folder_path, "fg_index.txt")
 
     # 3️⃣ Append new data if file exists, otherwise create a new file
     file_exists = os.path.isfile(filename)

@@ -1,0 +1,7 @@
+*.log
+*.tmp
+__pycache__/
+.DS_Store
+*.bak
+*.swp
+AppData/

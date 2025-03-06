@@ -40,7 +40,7 @@ def get_fear_greed_index():
         return None, None
 
 def update_github(timestamp, index_value):
-    """Updates fear_greed_data/fear_greed_data.csv and pushes to GitHub"""
+    """Updates fear_greed_data/fg_index.csv and pushes to GitHub"""
     
     # 1️⃣ Ensure `fear_greed_data/` folder exists
     folder_path = "fear_greed_data"

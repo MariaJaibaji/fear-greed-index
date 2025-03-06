@@ -3,6 +3,7 @@ import json
 import time
 from datetime import datetime
 import subprocess
+import os
 
 # CNN API URL
 CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata/"
@@ -37,26 +38,35 @@ def get_fear_greed_index():
         return None, None
 
 def update_github(date, index_value):
-    """Updates fear_greed_data.csv and pushes to GitHub"""
-    filename = "fear_greed_data.csv"
+    """Updates fear_greed_data/fear_greed_data.csv and pushes to GitHub"""
+    
+    # 1️⃣ Ensure `fear_greed_data/` folder exists
+    folder_path = "fear_greed_data"
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
 
-    # Update the CSV file
+    # 2️⃣ Save CSV inside `fear_greed_data/`
+    filename = os.path.join(folder_path, "fear_greed_data.csv")
+
     with open(filename, mode="w") as file:
         file.write("date,index\n")
         file.write(f"{date},{index_value}\n")
     
     print(f"✅ Updated {filename} with Fear & Greed Index: {index_value}")
 
-    # Push to GitHub
-    subprocess.run(["git", "add", filename])
-    subprocess.run(["git", "commit", "-m", f"Updated Fear & Greed Index: {index_value}"])
-    subprocess.run(["git", "push", "origin", "main"])
-    print("✅ Pushed updated data to GitHub.")
+    # 3️⃣ Push to GitHub
+    try:
+        subprocess.run(["git", "add", "."], check=True)
+        subprocess.run(["git", "commit", "-m", f"Updated Fear & Greed Index: {index_value}"], check=True)
+        subprocess.run(["git", "push", "origin", "main"], check=True)
+        print("✅ Pushed updated data to GitHub.")
+    except subprocess.CalledProcessError as e:
+        print("❌ Error pushing to GitHub:", e)
 
 if __name__ == "__main__":
     date, index_value = get_fear_greed_index()
     if index_value is not None:
         update_github(date, index_value)
-    
+
     # Run every hour
     time.sleep(3600)

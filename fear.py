@@ -67,11 +67,21 @@ def update_csv(date, index_value):
     print(f"✅ Updated {CSV_FILE} with Fear & Greed Index: {index_value}")
 
 def push_to_github():
-    """Pushes updated CSV file to GitHub"""
+    """Pushes updated CSV file to GitHub only if there are changes"""
     try:
+        # Check if there are any changes
+        status_output = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+        
+        # If output is empty, no changes exist
+        if not status_output.stdout.strip():
+            print("✅ No changes to commit. Skipping Git push.")
+            return
+
+        # Stage and commit changes
         subprocess.run(["git", "add", CSV_FILE], check=True)
-        subprocess.run(["git", "commit", "-m", f"Updated fg_index.csv with Fear & Greed Index"], check=True)
+        subprocess.run(["git", "commit", "-m", f"Updated FG_INDEX.csv with Fear & Greed Index"], check=True)
         subprocess.run(["git", "push", "origin", "main"], check=True)
+
         print("✅ Pushed updated data to GitHub.")
     except subprocess.CalledProcessError as e:
         print("❌ Error pushing to GitHub:", e)

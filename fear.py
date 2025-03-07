@@ -17,12 +17,17 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Ensure the data folder exists
+DATA_FOLDER = "data"
+os.makedirs(DATA_FOLDER, exist_ok=True)
+
+# Define file path
+CSV_FILE = os.path.join(DATA_FOLDER, "fg_index.csv")
+
 def get_fear_greed_index():
     """Fetches Fear & Greed Index from CNN and extracts the score"""
-    now = datetime.now()
-    timestamp = now.strftime('%Y-%m-%d %H:%M:%S')  # Fetch date & time
-
-    url = CNN_FEAR_GREED_URL + now.strftime('%Y-%m-%d')
+    today = datetime.today().strftime('%Y%m%dT')  # Format: YYYYMMDDT
+    url = CNN_FEAR_GREED_URL + datetime.today().strftime('%Y-%m-%d')
 
     try:
         response = requests.get(url, headers=HEADERS)
@@ -31,7 +36,8 @@ def get_fear_greed_index():
         if response.status_code == 200 and response.text.strip():
             data = response.json()
             fear_greed_score = round(data["fear_and_greed"]["score"], 2)
-            return timestamp, fear_greed_score
+
+            return today, fear_greed_score
         else:
             print("Error: Empty response or invalid status code.")
             return None, None
@@ -39,54 +45,42 @@ def get_fear_greed_index():
         print("Error fetching data:", e)
         return None, None
 
-def update_github(timestamp, index_value):
-    """Updates fear_greed_data/fg_index.txt and pushes to GitHub"""
+def update_csv(date, index_value):
+    """Writes or appends to fg_index.csv in the correct TradingView format"""
+    # Format line in (date, open, high, low, close, volume) format
+    line = f"{date},{index_value},{index_value},{index_value},{index_value},0\n"
+
+    # Check if file exists to avoid duplicates
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "r") as file:
+            lines = file.readlines()
+            last_line = lines[-1].strip() if lines else None
+            # Prevent duplicate entry
+            if last_line and last_line.startswith(date):
+                print("⚠️ Data for today already exists. Skipping update.")
+                return
     
-    # 1️⃣ Ensure `fear_greed_data/` folder exists
-    folder_path = "fear_greed_data"
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
+    # Append data
+    with open(CSV_FILE, "a") as file:
+        file.write(line)
 
-    # 2️⃣ Save file inside `fear_greed_data/`
-    filename = os.path.join(folder_path, "fg_index.txt")
+    print(f"✅ Updated {CSV_FILE} with Fear & Greed Index: {index_value}")
 
-    # 3️⃣ Append new data if file exists, otherwise create a new file
-    file_exists = os.path.isfile(filename)
-    
-    with open(filename, mode="a" if file_exists else "w") as file:
-        if not file_exists:
-            file.write("timestamp,index\n")  # Write header if new file
-        file.write(f"{timestamp},{index_value}\n")
-    
-    print(f"✅ Updated {filename} with Fear & Greed Index: {index_value} at {timestamp}")
-
-    # 4️⃣ Ensure Git recognizes the file change
-    subprocess.run(["git", "add", "-u"], check=True)  
-
-    # 5️⃣ Force Git to always create a commit, even if nothing changed
+def push_to_github():
+    """Pushes updated CSV file to GitHub"""
     try:
-        subprocess.run(["git", "commit", "--allow-empty", "-m", f"Updated Fear & Greed Index: {index_value} at {timestamp}"], check=True)
-    except subprocess.CalledProcessError:
-        print("⚠ No new changes to commit, but proceeding with push.")
-
-    # 6️⃣ Push to GitHub with retry logic
-    try:
+        subprocess.run(["git", "add", CSV_FILE], check=True)
+        subprocess.run(["git", "commit", "-m", f"Updated fg_index.csv with Fear & Greed Index"], check=True)
         subprocess.run(["git", "push", "origin", "main"], check=True)
         print("✅ Pushed updated data to GitHub.")
     except subprocess.CalledProcessError as e:
-        print("❌ Error pushing to GitHub, retrying...")
-        time.sleep(5)  # Wait before retrying
-        try:
-            subprocess.run(["git", "push", "origin", "main", "--force"], check=True)
-            print("✅ Successfully pushed after retry.")
-        except subprocess.CalledProcessError as e:
-            print("❌ Failed to push after retry:", e)
+        print("❌ Error pushing to GitHub:", e)
 
 if __name__ == "__main__":
-    while True:
-        timestamp, index_value = get_fear_greed_index()
-        if index_value is not None:
-            update_github(timestamp, index_value)
+    date, index_value = get_fear_greed_index()
+    if index_value is not None:
+        update_csv(date, index_value)
+        push_to_github()
 
-        print("⏳ Waiting for the next update in 1 hour...")
-        time.sleep(3600)  # Fetch data every 1 hour
+    # Run every hour
+    time.sleep(3600)

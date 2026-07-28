@@ -25,7 +25,7 @@
       <a href="#approach">Approach</a>
       <a href="#testimonials">Results</a>
       <a href="#faq">FAQ</a>
-      <a href="#contact" class="btn btn--primary btn--sm nav-cta">Book a Call</a>
+      <a href="#apply" class="btn btn--primary btn--sm nav-cta">Apply Now</a>
     </nav>
     <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation" aria-expanded="false">
       <span></span><span></span><span></span>
@@ -46,7 +46,7 @@
         that separates consistent traders from everyone else.
       </p>
       <div class="hero__actions reveal">
-        <a href="#contact" class="btn btn--primary">Book a Free Strategy Call</a>
+        <a href="#apply" class="btn btn--primary">Apply Now</a>
         <a href="#programs" class="btn btn--ghost">View Programs</a>
       </div>
       <p class="hero__disclaimer reveal">No hype, no signals-for-sale. Just process, risk control, and accountability.</p>
@@ -125,7 +125,7 @@
             <li>Risk & position sizing framework</li>
             <li>Private community access</li>
           </ul>
-          <a href="#contact" class="btn btn--outline btn--block">Learn More</a>
+          <a href="#apply" class="btn btn--outline btn--block">Apply Now</a>
         </div>
 
         <div class="program-card program-card--featured reveal">
@@ -139,7 +139,7 @@
             <li>Trade & journal reviews</li>
             <li>Direct chat support</li>
           </ul>
-          <a href="#contact" class="btn btn--primary btn--block">Book a Free Strategy Call</a>
+          <a href="#apply" class="btn btn--primary btn--block">Apply Now</a>
         </div>
 
         <div class="program-card reveal">
@@ -151,7 +151,7 @@
             <li>Market breakdowns & Q&A</li>
             <li>Accountability community</li>
           </ul>
-          <a href="#contact" class="btn btn--outline btn--block">Learn More</a>
+          <a href="#apply" class="btn btn--outline btn--block">Apply Now</a>
         </div>
       </div>
     </div>
@@ -235,7 +235,7 @@
             <span class="accordion-icon">+</span>
           </button>
           <div class="accordion-panel">
-            <p>We'll discuss this on your strategy call — the right starting size depends on your goals, market, and risk tolerance. We never recommend risking money you can't afford to lose.</p>
+            <p>We'll discuss this after reviewing your application — the right starting size depends on your goals, market, and risk tolerance. We never recommend risking money you can't afford to lose.</p>
           </div>
         </div>
         <div class="accordion-item reveal">
@@ -254,17 +254,17 @@
   <section class="cta-banner">
     <div class="container cta-banner__inner reveal">
       <h2>Ready to trade with a process instead of guesswork?</h2>
-      <p>Book a free strategy call and we'll map out where you are and what's holding you back.</p>
-      <a href="#contact" class="btn btn--primary btn--lg">Book a Free Strategy Call</a>
+      <p>Submit your application and we'll map out where you are and what's holding you back.</p>
+      <a href="#apply" class="btn btn--primary btn--lg">Apply Now</a>
     </div>
   </section>
 
-  <section id="contact" class="contact">
+  <section id="apply" class="contact">
     <div class="container contact__grid">
       <div class="contact__info reveal">
-        <p class="eyebrow">Get In Touch</p>
-        <h2>Let's talk about your trading.</h2>
-        <p>Fill out the form and we'll get back to you within 1-2 business days to schedule your free strategy call.</p>
+        <p class="eyebrow">Apply Now</p>
+        <h2>Start your mentorship application.</h2>
+        <p>Tell us about yourself and your trading goals. We review every application personally and get back to you within 1-2 business days.</p>
         <div class="contact__detail">
           <span class="contact__label">Email</span>
           <a href="mailto:hello@nervanatrading.com">hello@nervanatrading.com</a>
@@ -278,14 +278,24 @@
           </div>
         </div>
       </div>
-      <form class="contact__form reveal" id="contactForm">
+
+      <form class="contact__form reveal" id="applyForm" name="mentorship-application" method="POST" data-netlify="true" netlify-honeypot="company">
+        <input type="hidden" name="form-name" value="mentorship-application">
+        <p class="hp-field" aria-hidden="true">
+          <label>Don't fill this out if you're human: <input name="company" tabindex="-1" autocomplete="off"></label>
+        </p>
+
         <div class="form-row">
-          <label for="name">Name</label>
-          <input type="text" id="name" name="name" required placeholder="Your name">
+          <label for="name">Full name</label>
+          <input type="text" id="name" name="name" required placeholder="Your full name">
         </div>
         <div class="form-row">
           <label for="email">Email</label>
           <input type="email" id="email" name="email" required placeholder="you@example.com">
+        </div>
+        <div class="form-row">
+          <label for="phone">Phone (optional)</label>
+          <input type="tel" id="phone" name="phone" placeholder="+1 (555) 000-0000">
         </div>
         <div class="form-row">
           <label for="experience">Trading experience</label>
@@ -296,10 +306,33 @@
           </select>
         </div>
         <div class="form-row">
-          <label for="message">What are you looking for?</label>
-          <textarea id="message" name="message" rows="4" placeholder="Tell us a bit about your goals"></textarea>
+          <label for="program">Program you're interested in</label>
+          <select id="program" name="program">
+            <option value="foundations">Foundations</option>
+            <option value="1-on-1" selected>1-on-1 Mentorship</option>
+            <option value="community">Trading Community</option>
+            <option value="not-sure">Not sure yet</option>
+          </select>
         </div>
-        <button type="submit" class="btn btn--primary btn--block">Request a Strategy Call</button>
+        <div class="form-row">
+          <label for="commitment">Weekly time commitment</label>
+          <select id="commitment" name="commitment">
+            <option value="under-5">Under 5 hours</option>
+            <option value="5-10">5-10 hours</option>
+            <option value="10-20">10-20 hours</option>
+            <option value="20-plus">20+ hours</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="goals">What are your trading goals?</label>
+          <textarea id="goals" name="goals" rows="4" required placeholder="Tell us where you're at and what you're trying to achieve"></textarea>
+        </div>
+        <div class="form-row">
+          <label for="source">How did you hear about Nervana? (optional)</label>
+          <input type="text" id="source" name="source" placeholder="Instagram, referral, YouTube, etc.">
+        </div>
+
+        <button type="submit" class="btn btn--primary btn--block">Submit Application</button>
         <p class="form-status" id="formStatus" role="status"></p>
       </form>
     </div>

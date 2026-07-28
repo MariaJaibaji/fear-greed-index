@@ -68,12 +68,37 @@ document.querySelectorAll('.accordion-trigger').forEach((trigger) => {
   });
 });
 
-// Contact form (client-side only — wire up to a backend or form service before launch)
-const contactForm = document.getElementById('contactForm');
+// Mentorship application form — submits to Netlify Forms (requires hosting on Netlify)
+const applyForm = document.getElementById('applyForm');
 const formStatus = document.getElementById('formStatus');
 
-contactForm.addEventListener('submit', (e) => {
+function encodeFormData(form) {
+  return new URLSearchParams(new FormData(form)).toString();
+}
+
+applyForm.addEventListener('submit', (e) => {
   e.preventDefault();
-  formStatus.textContent = "Thanks — we'll be in touch within 1-2 business days.";
-  contactForm.reset();
+
+  const submitButton = applyForm.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  formStatus.classList.remove('form-status--error');
+  formStatus.textContent = 'Submitting...';
+
+  fetch('/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: encodeFormData(applyForm),
+  })
+    .then((response) => {
+      if (!response.ok) throw new Error('Submission failed');
+      formStatus.textContent = "Application received — we'll be in touch within 1-2 business days.";
+      applyForm.reset();
+    })
+    .catch(() => {
+      formStatus.classList.add('form-status--error');
+      formStatus.textContent = "Something went wrong. Please email hello@nervanatrading.com directly.";
+    })
+    .finally(() => {
+      submitButton.disabled = false;
+    });
 });

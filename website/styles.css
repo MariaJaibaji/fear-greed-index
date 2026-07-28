@@ -513,6 +513,15 @@ a { color: inherit; text-decoration: none; }
   color: var(--accent);
   min-height: 1.2em;
 }
+.form-status.form-status--error { color: var(--danger); }
+
+.hp-field {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
 
 /* Footer */
 .footer {

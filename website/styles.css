@@ -492,8 +492,10 @@ a { color: inherit; text-decoration: none; }
   gap: 18px;
 }
 .form-row { display: flex; flex-direction: column; gap: 8px; }
-.form-row label { font-size: 0.85rem; font-weight: 500; color: var(--text-dim); }
-.form-row input, .form-row select, .form-row textarea {
+.form-row > label { font-size: 0.85rem; font-weight: 500; color: var(--text-dim); }
+.form-row input:not([type="radio"]):not([type="checkbox"]),
+.form-row select,
+.form-row textarea {
   background: var(--bg);
   border: 1px solid var(--card-border);
   border-radius: 8px;
@@ -505,8 +507,47 @@ a { color: inherit; text-decoration: none; }
   transition: border-color 0.15s ease;
   resize: vertical;
 }
-.form-row input:focus, .form-row select:focus, .form-row textarea:focus {
+.form-row input:not([type="radio"]):not([type="checkbox"]):focus,
+.form-row select:focus,
+.form-row textarea:focus {
   border-color: var(--accent);
+}
+.form-row .other-input { margin-top: 2px; }
+
+.form-section-title {
+  font-family: var(--font-heading);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--gold);
+  margin: 8px 0 -4px;
+  padding-top: 20px;
+  border-top: 1px solid var(--card-border);
+}
+.form-section-title:first-of-type { border-top: none; padding-top: 0; }
+
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.radio-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 0.9rem;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-weight: 400;
+}
+.radio-option input[type="radio"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  cursor: pointer;
 }
 .form-status {
   font-size: 0.85rem;

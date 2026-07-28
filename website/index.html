@@ -263,8 +263,16 @@
     <div class="container contact__grid">
       <div class="contact__info reveal">
         <p class="eyebrow">Apply Now</p>
-        <h2>Start your mentorship application.</h2>
-        <p>Tell us about yourself and your trading goals. We review every application personally and get back to you within 1-2 business days.</p>
+        <h2>Mentorship Application</h2>
+        <p>
+          This mentorship is highly limited. I work strictly 1:1 with traders who are serious
+          about developing independence, discipline, and clarity — this is not group coaching.
+        </p>
+        <p>
+          Submitting this application does not guarantee a place. Applicants are assessed on
+          fit, readiness, and commitment. If shortlisted, you'll be invited to a free onboarding
+          session to confirm we're aligned before moving forward.
+        </p>
         <div class="contact__detail">
           <span class="contact__label">Email</span>
           <a href="mailto:hello@nervanatrading.com">hello@nervanatrading.com</a>
@@ -285,51 +293,111 @@
           <label>Don't fill this out if you're human: <input name="company" tabindex="-1" autocomplete="off"></label>
         </p>
 
+        <p class="form-section-title">About you</p>
+
         <div class="form-row">
-          <label for="name">Full name</label>
-          <input type="text" id="name" name="name" required placeholder="Your full name">
+          <label for="name">Full name *</label>
+          <input type="text" id="name" name="full_name" required placeholder="Your full name">
         </div>
         <div class="form-row">
-          <label for="email">Email</label>
+          <label for="email">Email address *</label>
           <input type="email" id="email" name="email" required placeholder="you@example.com">
         </div>
         <div class="form-row">
-          <label for="phone">Phone (optional)</label>
-          <input type="tel" id="phone" name="phone" placeholder="+1 (555) 000-0000">
+          <label for="location">Location / Time zone *</label>
+          <input type="text" id="location" name="location_timezone" required placeholder="e.g. London, UK (GMT)">
         </div>
         <div class="form-row">
-          <label for="experience">Trading experience</label>
-          <select id="experience" name="experience">
-            <option value="beginner">Beginner</option>
-            <option value="intermediate">Intermediate</option>
-            <option value="experienced">Experienced</option>
-          </select>
+          <label>How did you hear about Nervana Mentorship?</label>
+          <div class="radio-group">
+            <label class="radio-option"><input type="radio" name="how_heard" value="TradingView"> TradingView</label>
+            <label class="radio-option"><input type="radio" name="how_heard" value="YouTube"> YouTube</label>
+            <label class="radio-option"><input type="radio" name="how_heard" value="Referral"> Referral</label>
+            <label class="radio-option"><input type="radio" name="how_heard" value="Other"> Other</label>
+          </div>
+          <input type="text" name="how_heard_other" placeholder="If “Other”, please specify" class="other-input">
+        </div>
+
+        <p class="form-section-title">Your trading background</p>
+
+        <div class="form-row">
+          <label>How long have you been trading?</label>
+          <div class="radio-group">
+            <label class="radio-option"><input type="radio" name="trading_duration" value="Less than 6 months"> Less than 6 months</label>
+            <label class="radio-option"><input type="radio" name="trading_duration" value="6-12 months"> 6-12 months</label>
+            <label class="radio-option"><input type="radio" name="trading_duration" value="1-2 years"> 1-2 years</label>
+            <label class="radio-option"><input type="radio" name="trading_duration" value="2+ years"> 2+ years</label>
+            <label class="radio-option"><input type="radio" name="trading_duration" value="Other"> Other</label>
+          </div>
         </div>
         <div class="form-row">
-          <label for="program">Program you're interested in</label>
-          <select id="program" name="program">
-            <option value="foundations">Foundations</option>
-            <option value="1-on-1" selected>1-on-1 Mentorship</option>
-            <option value="community">Trading Community</option>
-            <option value="not-sure">Not sure yet</option>
-          </select>
+          <label>What markets do you primarily trade?</label>
+          <div class="radio-group">
+            <label class="radio-option"><input type="radio" name="markets_traded" value="Forex"> Forex</label>
+            <label class="radio-option"><input type="radio" name="markets_traded" value="Indices"> Indices</label>
+            <label class="radio-option"><input type="radio" name="markets_traded" value="Stocks"> Stocks</label>
+            <label class="radio-option"><input type="radio" name="markets_traded" value="Crypto"> Crypto</label>
+            <label class="radio-option"><input type="radio" name="markets_traded" value="Options"> Options</label>
+            <label class="radio-option"><input type="radio" name="markets_traded" value="Other"> Other</label>
+          </div>
         </div>
         <div class="form-row">
-          <label for="commitment">Weekly time commitment</label>
-          <select id="commitment" name="commitment">
-            <option value="under-5">Under 5 hours</option>
-            <option value="5-10">5-10 hours</option>
-            <option value="10-20">10-20 hours</option>
-            <option value="20-plus">20+ hours</option>
-          </select>
+          <label for="strategy">Briefly describe your current trading strategy (if any) *</label>
+          <textarea id="strategy" name="current_strategy" rows="4" required></textarea>
         </div>
         <div class="form-row">
-          <label for="goals">What are your trading goals?</label>
-          <textarea id="goals" name="goals" rows="4" required placeholder="Tell us where you're at and what you're trying to achieve"></textarea>
+          <label for="mentor-experience">Have you worked with a mentor before? If yes, what was your experience? *</label>
+          <textarea id="mentor-experience" name="mentor_experience" rows="4" required></textarea>
+        </div>
+
+        <p class="form-section-title">Friction &amp; goals</p>
+
+        <div class="form-row">
+          <label>Where do you feel the most friction in your trading?</label>
+          <div class="radio-group">
+            <label class="radio-option"><input type="radio" name="friction" value="Strategy and structure"> Strategy and structure</label>
+            <label class="radio-option"><input type="radio" name="friction" value="Emotional regulation under pressure"> Emotional regulation under pressure</label>
+            <label class="radio-option"><input type="radio" name="friction" value="Consistency and discipline"> Consistency and discipline</label>
+            <label class="radio-option"><input type="radio" name="friction" value="Decision fatigue or overthinking"> Decision fatigue or overthinking</label>
+            <label class="radio-option"><input type="radio" name="friction" value="Other"> Other</label>
+          </div>
         </div>
         <div class="form-row">
-          <label for="source">How did you hear about Nervana? (optional)</label>
-          <input type="text" id="source" name="source" placeholder="Instagram, referral, YouTube, etc.">
+          <label for="goals-6-12">What are your top 3 goals for the next 6-12 months as a trader? *</label>
+          <textarea id="goals-6-12" name="goals_6_12_months" rows="4" required></textarea>
+        </div>
+        <div class="form-row">
+          <label for="adapts-to-you">Most mentorships give you rules and expect you to adapt. Nervana rebuilds the system around you. How does that approach resonate with you? *</label>
+          <textarea id="adapts-to-you" name="approach_resonance" rows="4" required></textarea>
+        </div>
+
+        <p class="form-section-title">Commitment &amp; investment</p>
+
+        <div class="form-row">
+          <label for="weekly-hours">How many focused hours per week can you realistically commit to reviews, reflections, and structured development of your trading? *</label>
+          <input type="text" id="weekly-hours" name="weekly_hours_commitment" required placeholder="e.g. 5-7 hours a week">
+        </div>
+        <div class="form-row">
+          <label>What level of investment are you prepared to make in your growth as a trader? *</label>
+          <div class="radio-group">
+            <label class="radio-option"><input type="radio" name="investment_level" value="Under £500" required> I'm only comfortable with small investments (&lt;£500)</label>
+            <label class="radio-option"><input type="radio" name="investment_level" value="£500-£1,000"> I'm ready to make a moderate investment (£500-£1,000)</label>
+            <label class="radio-option"><input type="radio" name="investment_level" value="£1,000-£3,000"> I'm committed to making a serious investment (£1,000-£3,000)</label>
+            <label class="radio-option"><input type="radio" name="investment_level" value="£3,000+"> I'm prepared to invest significantly in long-term mentorship (£3,000+)</label>
+            <label class="radio-option"><input type="radio" name="investment_level" value="Other"> Other</label>
+          </div>
+        </div>
+        <div class="form-row">
+          <label>Mentorship requires honesty, accountability, and resilience. Are you prepared to commit to that? *</label>
+          <div class="radio-group">
+            <label class="radio-option"><input type="radio" name="commitment_confirmation" value="Yes" required> Yes</label>
+            <label class="radio-option"><input type="radio" name="commitment_confirmation" value="No"> No</label>
+            <label class="radio-option"><input type="radio" name="commitment_confirmation" value="Other"> Other</label>
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="good-fit">Why do you believe you are a good fit for Nervana Mentorship? *</label>
+          <textarea id="good-fit" name="good_fit_reason" rows="4" required></textarea>
         </div>
 
         <button type="submit" class="btn btn--primary btn--block">Submit Application</button>

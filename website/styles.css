@@ -6,9 +6,8 @@
   --text: #eef2f7;
   --text-dim: #9aa8bd;
   --text-faint: #6b7889;
-  --accent: #22c58b;
-  --accent-dim: #1a9c6d;
-  --gold: #d4af37;
+  --accent: #d4af37;
+  --accent-dim: #a9822f;
   --danger: #e5484d;
   --font-heading: "Space Grotesk", Inter, sans-serif;
   --font-body: "Inter", sans-serif;
@@ -95,10 +94,10 @@ a { color: inherit; text-decoration: none; }
 }
 .btn--primary {
   background: linear-gradient(135deg, var(--accent), var(--accent-dim));
-  color: #05130d;
-  box-shadow: 0 8px 24px -8px rgba(34, 197, 139, 0.6);
+  color: #1a1508;
+  box-shadow: 0 8px 24px -8px rgba(212, 175, 55, 0.55);
 }
-.btn--primary:hover { transform: translateY(-2px); box-shadow: 0 12px 28px -8px rgba(34, 197, 139, 0.75); }
+.btn--primary:hover { transform: translateY(-2px); box-shadow: 0 12px 28px -8px rgba(212, 175, 55, 0.7); }
 .btn--ghost {
   background: transparent;
   color: var(--text);
@@ -147,7 +146,7 @@ a { color: inherit; text-decoration: none; }
   place-items: center;
   border-radius: 9px;
   background: linear-gradient(135deg, var(--accent), var(--accent-dim));
-  color: #05130d;
+  color: #1a1508;
   font-weight: 800;
 }
 .nav-links {
@@ -191,8 +190,8 @@ a { color: inherit; text-decoration: none; }
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(600px 400px at 15% 20%, rgba(34, 197, 139, 0.16), transparent 60%),
-    radial-gradient(500px 400px at 85% 10%, rgba(212, 175, 55, 0.10), transparent 60%),
+    radial-gradient(600px 400px at 15% 20%, rgba(212, 175, 55, 0.16), transparent 60%),
+    radial-gradient(500px 400px at 85% 10%, rgba(169, 130, 47, 0.12), transparent 60%),
     linear-gradient(180deg, var(--bg) 0%, var(--bg-alt) 100%);
   z-index: -1;
 }
@@ -290,7 +289,7 @@ a { color: inherit; text-decoration: none; }
   content: "→";
   position: absolute;
   left: 0;
-  color: var(--gold);
+  color: var(--accent);
 }
 
 /* Programs */
@@ -322,14 +321,14 @@ a { color: inherit; text-decoration: none; }
 .program-card:hover { transform: translateY(-4px); border-color: #2a3a52; }
 .program-card--featured {
   border-color: var(--accent);
-  background: linear-gradient(180deg, rgba(34,197,139,0.08), var(--card) 40%);
+  background: linear-gradient(180deg, rgba(212,175,55,0.1), var(--card) 40%);
 }
 .badge {
   position: absolute;
   top: -12px;
   right: 24px;
   background: var(--accent);
-  color: #05130d;
+  color: #1a1508;
   font-size: 0.72rem;
   font-weight: 700;
   padding: 5px 12px;
@@ -337,7 +336,7 @@ a { color: inherit; text-decoration: none; }
   letter-spacing: 0.03em;
 }
 .program-price {
-  color: var(--gold);
+  color: var(--accent);
   font-weight: 600;
   font-size: 0.9rem;
   margin: 8px 0 14px;
@@ -469,7 +468,7 @@ a { color: inherit; text-decoration: none; }
 /* CTA banner */
 .cta-banner {
   padding: 90px 0;
-  background: linear-gradient(135deg, rgba(34,197,139,0.14), rgba(212,175,55,0.08));
+  background: linear-gradient(135deg, rgba(212,175,55,0.16), rgba(169,130,47,0.08));
   border-top: 1px solid var(--card-border);
   border-bottom: 1px solid var(--card-border);
 }
@@ -541,7 +540,7 @@ a { color: inherit; text-decoration: none; }
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--gold);
+  color: var(--accent);
   margin: 8px 0 -4px;
   padding-top: 20px;
   border-top: 1px solid var(--card-border);

@@ -96,7 +96,7 @@ applyForm.addEventListener('submit', (e) => {
     })
     .catch(() => {
       formStatus.classList.add('form-status--error');
-      formStatus.textContent = "Something went wrong. Please email hello@nervanatrading.com directly.";
+      formStatus.textContent = "Something went wrong. Please email hello@nervanalimited.com directly.";
     })
     .finally(() => {
       submitButton.disabled = false;

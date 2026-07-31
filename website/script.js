@@ -68,6 +68,34 @@ document.querySelectorAll('.accordion-trigger').forEach((trigger) => {
   });
 });
 
+// Apply modal
+const applyModalOverlay = document.getElementById('applyModalOverlay');
+const applyModalClose = document.getElementById('applyModalClose');
+const applyTriggers = document.querySelectorAll('.js-apply-trigger');
+
+function openApplyModal(e) {
+  if (e) e.preventDefault();
+  applyModalOverlay.classList.add('open');
+  applyModalOverlay.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+  applyModalClose.focus();
+}
+
+function closeApplyModal() {
+  applyModalOverlay.classList.remove('open');
+  applyModalOverlay.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+}
+
+applyTriggers.forEach((trigger) => trigger.addEventListener('click', openApplyModal));
+applyModalClose.addEventListener('click', closeApplyModal);
+applyModalOverlay.addEventListener('click', (e) => {
+  if (e.target === applyModalOverlay) closeApplyModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && applyModalOverlay.classList.contains('open')) closeApplyModal();
+});
+
 // Mentorship application form — submits to Netlify Forms (requires hosting on Netlify)
 const applyForm = document.getElementById('applyForm');
 const formStatus = document.getElementById('formStatus');

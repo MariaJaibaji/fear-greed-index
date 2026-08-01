@@ -211,8 +211,8 @@ a { color: inherit; text-decoration: none; }
   color: var(--text-faint);
 }
 
-.insights-hero { padding: 140px 0 60px; }
-.insights-hero .hero__subtitle { margin-bottom: 0; }
+.page-hero { padding: 140px 0 60px; }
+.page-hero .hero__subtitle { margin-bottom: 0; }
 
 /* Insights list */
 .insights-list { padding: 60px 0 110px; }

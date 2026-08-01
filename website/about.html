@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Daily Insights | Nervana</title>
-<meta name="description" content="Daily notes on US100 (Nasdaq 100) price action and structure from Nervana. More assets as the desk grows.">
+<title>About | Nervana</title>
+<meta name="description" content="Nervana is a strictly 1:1 trading mentorship built on two layers: Base (strategic structure) and Core (cognitive engineering).">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📈</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -20,11 +20,11 @@
       <span class="brand__name">Nervana</span>
     </a>
     <nav class="nav-links" id="navLinks">
-      <a href="about.html">About</a>
+      <a href="about.html" aria-current="page">About</a>
       <a href="mentorship.html">Mentorship</a>
       <a href="system.html">The System</a>
       <a href="results.html">Results</a>
-      <a href="insights.html" aria-current="page">Insights</a>
+      <a href="insights.html">Insights</a>
       <a href="faq.html">FAQ</a>
       <a href="#" class="btn btn--primary btn--sm nav-cta js-apply-trigger">Apply Now</a>
     </nav>
@@ -39,18 +39,35 @@
   <section class="hero page-hero">
     <div class="hero__bg" aria-hidden="true"></div>
     <div class="container hero__inner">
-      <p class="eyebrow reveal">Daily Insights</p>
-      <h1 class="reveal">US100 — Daily Market Notes</h1>
-      <p class="hero__subtitle reveal">
-        Short, dated notes on how I'm reading Nasdaq 100 structure. More assets as the desk grows.
-      </p>
+      <p class="eyebrow reveal">About Nervana</p>
+      <h1 class="reveal">Markets reward process, not predictions.</h1>
     </div>
   </section>
 
-  <section class="insights-list">
-    <div class="container">
-      <div class="asset-tabs" id="assetTabs"></div>
-      <div class="insight-feed" id="insightFeed"></div>
+  <section class="about">
+    <div class="container about__grid">
+      <div class="about__text reveal">
+        <p>
+          Most traders fail not because they lack a good setup, but because they lack a process
+          they can actually follow under pressure. Nervana fixes that through direct, 1:1
+          mentorship built on two layers: <strong>Base</strong>, the strategic structure for
+          consistent execution, and <strong>Core</strong>, the psychology work that makes it hold
+          under pressure.
+        </p>
+        <ul class="check-list">
+          <li>Personalized trading plan built around your risk tolerance</li>
+          <li>Direct feedback on your trades and journal, not generic advice</li>
+        </ul>
+      </div>
+      <div class="about__card reveal">
+        <div class="card-panel">
+          <h3>Who this is for</h3>
+          <ul class="tick-list">
+            <li>New traders who want to skip years of trial and error</li>
+            <li>Experienced traders stuck at inconsistent results</li>
+          </ul>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -219,7 +236,5 @@
 </div>
 
 <script src="script.js"></script>
-<script src="insights-data.js"></script>
-<script src="insights.js"></script>
 </body>
 </html>

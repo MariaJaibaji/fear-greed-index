@@ -1,12 +1,13 @@
 // Footer year
 document.getElementById('year').textContent = new Date().getFullYear();
 
-// Mobile nav toggle
+// Nav dropdown toggle
 const navbar = document.getElementById('navbar');
 const navToggle = document.getElementById('navToggle');
 const navLinks = document.getElementById('navLinks');
 
-navToggle.addEventListener('click', () => {
+navToggle.addEventListener('click', (e) => {
+  e.stopPropagation();
   const isOpen = navbar.classList.toggle('open');
   navToggle.setAttribute('aria-expanded', String(isOpen));
 });
@@ -16,6 +17,13 @@ navLinks.querySelectorAll('a').forEach((link) => {
     navbar.classList.remove('open');
     navToggle.setAttribute('aria-expanded', 'false');
   });
+});
+
+document.addEventListener('click', (e) => {
+  if (navbar.classList.contains('open') && !navbar.contains(e.target)) {
+    navbar.classList.remove('open');
+    navToggle.setAttribute('aria-expanded', 'false');
+  }
 });
 
 // Scroll reveal animation

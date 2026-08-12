@@ -58,7 +58,10 @@ useStop        = input.bool(true,  "Use Stop Loss",                   group="Str
 stopUnit       = input.string("Points", "Stop loss units", ["Points", "Percent"], group="Strategy", tooltip="Points = a fixed point distance. Percent = a % of the entry (avg) price, so the stop scales with price across a long backtest (275 pts at ~30k ~ 0.9%).")
 stopPts        = input.float(275,  "Stop Loss (points)", minval=1,    group="Strategy")
 stopPct        = input.float(0.89,  "Stop Loss (% of entry)", minval=0.01, group="Strategy")
-useTrailStop   = input.bool(false, "Trail Stop to Breakeven + TP Increments", group="Strategy", tooltip="Once the Stop Trail Day/Time is reached (in the Warning Timezone), the stop loss moves to breakeven (entry price), then steps up in 500-pt/1.66% TP increments as each level is confirmed in the trade's favor. The stop only ever tightens, never loosens.")
+useTrailStop   = input.bool(false, "Trail Stop to Breakeven + Step Increments", group="Strategy", tooltip="Once the Stop Trail Day/Time is reached (in the Warning Timezone), the stop loss moves to breakeven (entry price), then steps up in Trail Step increments as price reaches them, in the trade's favor. The stop only ever tightens, never loosens.")
+trailStepUnit  = input.string("Points", "Trail Step Units", ["Points", "Percent"], group="Strategy", tooltip="Points = a fixed point increment. Percent = a % of the relevant weekly extreme, so the trail step scales with price. Independent from the main TP Increment settings, so you can tune it separately.")
+trailStepPts   = input.float(500,  "Trail Step (points)", minval=1,    group="Strategy")
+trailStepPct   = input.float(1.66, "Trail Step (% of price)", minval=0.01, group="Strategy")
 trailDay       = input.string("Thursday", "Stop Trail Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Strategy")
 trailHour      = input.int(12,     "Stop Trail Hour",   minval=0, maxval=23, group="Strategy")
 trailMin       = input.int(0,      "Stop Trail Minute", minval=0, maxval=59, group="Strategy")
@@ -471,17 +474,23 @@ afterWindowEnd = wDow == warnEndDayInt and (wHour > warnEndHour or (wHour == war
 forceExit      = wDow == warnEndDayInt and (wHour > exitHour or (wHour == exitHour and wMin >= exitMin))
 
 // Trailing stop: once the Stop Trail Day/Time is reached, move the stop to breakeven, then step it up
-// to each confirmed TP increment in the trade's favor (500-pt/1.66% steps) as price reaches them - so it
-// rises breakeven -> TP1 -> TP2 -> ... rather than jumping straight to whatever is already confirmed.
-// It only ever tightens, never loosens.
+// through Trail Step increments (own Points/Percent unit + amount, independent of the main TP Increment
+// settings) as price reaches them in the trade's favor - so it rises breakeven -> step 1 -> step 2 -> ...
+// rather than jumping straight to wherever price already is. It only ever tightens, never loosens.
 trailDayInt    = dayNameToInt(trailDay)
 pastTrailTime  = wDow > trailDayInt or (wDow == trailDayInt and (wHour > trailHour or (wHour == trailHour and wMin >= trailMin)))
+
+float trailStepUp = trailStepUnit == "Percent" and not na(wLow)  ? wLow  * trailStepPct / 100 : trailStepPts
+float trailStepDn = trailStepUnit == "Percent" and not na(wHigh) ? wHigh * trailStepPct / 100 : trailStepPts
+int trailStepsUp   = trailStepUp > 0 and not na(wHigh) and not na(wLow) ? int(math.floor((wHigh - wLow) / trailStepUp)) : 0
+int trailStepsDown = trailStepDn > 0 and not na(wHigh) and not na(wLow) ? int(math.floor((wHigh - wLow) / trailStepDn)) : 0
+
 float trailLevelLong  = strategy.position_avg_price
 float trailLevelShort = strategy.position_avg_price
-if confirmedUp > 0
-    trailLevelLong := math.max(trailLevelLong, wLow + tpStepUpMain * confirmedUp)
-if confirmedDown > 0
-    trailLevelShort := math.min(trailLevelShort, wHigh - tpStepDnMain * confirmedDown)
+if trailStepsUp > 0
+    trailLevelLong := math.max(trailLevelLong, wLow + trailStepUp * trailStepsUp)
+if trailStepsDown > 0
+    trailLevelShort := math.min(trailLevelShort, wHigh - trailStepDn * trailStepsDown)
 
 // Stop loss - active at all times (a resting price-level order; fills at the stop price on any bar).
 // Distance is a fixed point amount, or a % of the entry (avg) price when Percent units are selected.

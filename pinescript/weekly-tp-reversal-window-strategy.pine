@@ -66,6 +66,7 @@ trailDay       = input.string("Thursday", "Stop Trail Day", options=["Sunday", "
 trailHour      = input.int(12,     "Stop Trail Hour",   minval=0, maxval=23, group="Strategy")
 trailMin       = input.int(0,      "Stop Trail Minute", minval=0, maxval=59, group="Strategy")
 showTrailPlot  = input.bool(true, "Show Trailing Stop on Chart", group="Strategy", tooltip="Plots the live stop level (solid, steps up with the trail) and the trail's target level (dotted, where it's climbing toward) while a trade is open.")
+showReasons    = input.bool(true, "Show Entry/Exit Reasoning Labels", group="Strategy", tooltip="Labels each entry and exit on the chart with why it fired (which level triggered it, or which exit rule closed it), and attaches the same text to the trade so it shows in the Strategy Tester's List of Trades.")
 exitHour       = input.int(21,     "Force-exit hour (window-end day)",   minval=0, maxval=23, group="Strategy", tooltip="Latest exit on the Warning End Day, in the Warning Timezone. Any trade still open is closed at this time - no weekend hold. The TP can still exit earlier.")
 exitMin        = input.int(45,      "Force-exit minute (window-end day)", minval=0, maxval=59, group="Strategy")
 lockExecTf     = input.bool(true, "Lock execution to a fixed timeframe", group="Strategy", tooltip="On = read the entry, exit and reversal-window on a FIXED timeframe (below) via request.security, so changing the CHART timeframe no longer changes the results. Keep the chart at that timeframe or LOWER. Off (default) = use the chart's own bars - the behaviour that produced the tuned result.")
@@ -431,24 +432,29 @@ string dir = not na(warnTrend) ? warnTrend : mode   // captured trend, else live
 // full 1.66%/500-pt TP. Off -> enter at the first in-window bar that has a direction. Uses xHigh/xLow so
 // the touch test respects the locked timeframe when the lock is on.
 bool nearTP = false
+string nearReason = na
 if dir == "down"
     if entryAtReversal
         float rlvl = wHigh - threshDnMain
         if not na(rlvl) and rlvl > 0 and math.abs(xLow - rlvl) <= rlvl * tpProxPct / 100
             nearTP := true
+            nearReason := "0.83% reversal (" + str.tostring(int(threshDnMain)) + "pt) off weekly high"
     for i = 1 to tpLevels
         float lvl = wHigh - tpStepDnMain * i
         if not na(lvl) and lvl > 0 and math.abs(xLow - lvl) <= lvl * tpProxPct / 100
             nearTP := true
+            nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepDnMain * i)) + "pt) off weekly high"
 else if dir == "up"
     if entryAtReversal
         float rlvl = wLow + threshUpMain
         if not na(rlvl) and rlvl > 0 and math.abs(xHigh - rlvl) <= rlvl * tpProxPct / 100
             nearTP := true
+            nearReason := "0.83% reversal (" + str.tostring(int(threshUpMain)) + "pt) off weekly low"
     for i = 1 to tpLevels
         float lvl = wLow + tpStepUpMain * i
         if not na(lvl) and lvl > 0 and math.abs(xHigh - lvl) <= lvl * tpProxPct / 100
             nearTP := true
+            nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepUpMain * i)) + "pt) off weekly low"
 bool entryTrigger = useTPEntry ? nearTP : true
 
 // Weekly-open filter with an openTolPct % tolerance band: a LONG (fades a dip) is allowed BELOW the weekly
@@ -459,10 +465,16 @@ bool openOkShort = not na(weekOpen) and xClose > weekOpen * (1 - openTolPct / 10
 
 if inWarnWindow and not tradedWindow and not na(dir) and entryTrigger and xNewBar
     if dir == "down" and enableLongs and openOkLong
-        strategy.entry("Long", strategy.long)
+        longReason = "LONG - bearish into window, reversal UP: " + (useTPEntry ? nearReason : "window start (no TP-sweep filter)")
+        strategy.entry("Long", strategy.long, comment=longReason)
+        if showReasons
+            label.new(bar_index, xLow, longReason, style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
         tradedWindow := true
     else if dir == "up" and enableShorts and openOkShort
-        strategy.entry("Short", strategy.short)
+        shortReason = "SHORT - bullish into window, reversal DOWN: " + (useTPEntry ? nearReason : "window start (no TP-sweep filter)")
+        strategy.entry("Short", strategy.short, comment=shortReason)
+        if showReasons
+            label.new(bar_index, xHigh, shortReason, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
         tradedWindow := true
 
 // ---- Exit ----
@@ -500,13 +512,21 @@ if trailStepsDown > 0
 float stopDist = stopUnit == "Percent" ? strategy.position_avg_price * stopPct / 100 : stopPts
 float longStopLevel  = strategy.position_avg_price - stopDist
 float shortStopLevel = strategy.position_avg_price + stopDist
+bool  longStopTrailed  = false
+bool  shortStopTrailed = false
 if useTrailStop and pastTrailTime
-    longStopLevel := math.max(longStopLevel, trailLevelLong)
-    shortStopLevel := math.min(shortStopLevel, trailLevelShort)
+    if trailLevelLong > longStopLevel
+        longStopLevel := trailLevelLong
+        longStopTrailed := true
+    if trailLevelShort < shortStopLevel
+        shortStopLevel := trailLevelShort
+        shortStopTrailed := true
+longStopReason  = longStopTrailed  ? "Trailing stop hit @ " + formatPrice(longStopLevel)  + " (locked-in profit)" : "Stop loss hit @ " + formatPrice(longStopLevel)
+shortStopReason = shortStopTrailed ? "Trailing stop hit @ " + formatPrice(shortStopLevel) + " (locked-in profit)" : "Stop loss hit @ " + formatPrice(shortStopLevel)
 if useStop and strategy.position_size > 0
-    strategy.exit("Long Stop", from_entry="Long", stop=longStopLevel)
+    strategy.exit("Long Stop", from_entry="Long", stop=longStopLevel, comment_loss=longStopReason)
 if useStop and strategy.position_size < 0
-    strategy.exit("Short Stop", from_entry="Short", stop=shortStopLevel)
+    strategy.exit("Short Stop", from_entry="Short", stop=shortStopLevel, comment_loss=shortStopReason)
 
 // ---- Visualize the trailing stop on the chart ----
 // Solid line = the actual active stop (steps up/down as each Trail Step level is confirmed by a close).
@@ -520,13 +540,25 @@ plot(showTrailPlot and useTrailStop and strategy.position_size < 0 ? trailLevelS
 // TP-flip exit - only from the window-end day's window-end time onward, assessed once per locked bar.
 if afterWindowEnd and xNewBar
     if strategy.position_size > 0 and mode == "down"
-        strategy.close("Long", comment="TP resistance flip")
+        flipReason = "LONG exit - trend flipped DOWN (up-TP became resistance)"
+        strategy.close("Long", comment=flipReason)
+        if showReasons
+            label.new(bar_index, xClose, flipReason, style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
     if strategy.position_size < 0 and mode == "up"
-        strategy.close("Short", comment="TP support flip")
+        flipReason = "SHORT exit - trend flipped UP (down-TP became support)"
+        strategy.close("Short", comment=flipReason)
+        if showReasons
+            label.new(bar_index, xClose, flipReason, style=label.style_label_up, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
 
 // Latest exit: force close on the window-end day at the exit time (no weekend hold). Week-rollover is a
 // safety net only.
 if forceExit and xNewBar
-    strategy.close_all(comment="Window-end time stop")
+    timeReason = "Force exit - window-end time reached, no weekend hold"
+    if showReasons and strategy.position_size != 0
+        label.new(bar_index, xClose, timeReason, style=label.style_label_left, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+    strategy.close_all(comment=timeReason)
 else if ta.change(time("W")) != 0
-    strategy.close_all(comment="Week end (safety)")
+    safetyReason = "Week rollover - safety close"
+    if showReasons and strategy.position_size != 0
+        label.new(bar_index, xClose, safetyReason, style=label.style_label_left, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+    strategy.close_all(comment=safetyReason)

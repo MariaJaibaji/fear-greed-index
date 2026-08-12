@@ -38,13 +38,12 @@ dnCol     = input.color(color.new(#ec407a, 75), "Down Volume", group="Volume Pro
 showPoc   = input.bool(false, "Show POC Label", group="Volume Profile")
 vpOffset  = input.int(0, "Right-side gap (bars past profile)", minval=0, maxval=300, group="Volume Profile", tooltip="The profile is auto-placed just to the right of price - its own Max Width is accounted for automatically, so it never overlaps the candles. This adds N extra bars of clearance beyond that. Total right-shift is capped at 500 (Pine's future-draw limit).")
 
-dayOptions   = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 showWarning  = input.bool(true, "Show Reversal Warning", group="Reversal Warning")
 cutoffTz     = input.string("Europe/London", "Warning Timezone", group="Reversal Warning")
-cutoffDay    = input.string("Wednesday", "Warning Start Day", options=dayOptions, group="Reversal Warning")
+cutoffDay    = input.string("Wednesday", "Warning Start Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Reversal Warning")
 cutoffHour   = input.int(13, "Warning Start Hour", minval=0, maxval=23, group="Reversal Warning")
 cutoffMinute = input.int(15, "Warning Start Minute", minval=0, maxval=59, group="Reversal Warning")
-warnEndDay   = input.string("Friday", "Warning End Day", options=dayOptions, group="Reversal Warning")
+warnEndDay   = input.string("Friday", "Warning End Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Reversal Warning")
 warnEndHour  = input.int(9, "Warning End Hour", minval=0, maxval=23, group="Reversal Warning")
 warnEndMin   = input.int(45, "Warning End Minute", minval=0, maxval=59, group="Reversal Warning")
 
@@ -60,7 +59,7 @@ stopUnit       = input.string("Points", "Stop loss units", ["Points", "Percent"]
 stopPts        = input.float(275,  "Stop Loss (points)", minval=1,    group="Strategy")
 stopPct        = input.float(0.89,  "Stop Loss (% of entry)", minval=0.01, group="Strategy")
 useTrailStop   = input.bool(false, "Trail Stop to Breakeven + TP Increments", group="Strategy", tooltip="Once the Stop Trail Day/Time is reached (in the Warning Timezone), the stop loss moves to breakeven (entry price), then steps up in 500-pt/1.66% TP increments as each level is confirmed in the trade's favor. The stop only ever tightens, never loosens.")
-trailDay       = input.string("Thursday", "Stop Trail Day", options=dayOptions, group="Strategy")
+trailDay       = input.string("Thursday", "Stop Trail Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Strategy")
 trailHour      = input.int(12,     "Stop Trail Hour",   minval=0, maxval=23, group="Strategy")
 trailMin       = input.int(0,      "Stop Trail Minute", minval=0, maxval=59, group="Strategy")
 exitHour       = input.int(21,     "Force-exit hour (window-end day)",   minval=0, maxval=23, group="Strategy", tooltip="Latest exit on the Warning End Day, in the Warning Timezone. Any trade still open is closed at this time - no weekend hold. The TP can still exit earlier.")

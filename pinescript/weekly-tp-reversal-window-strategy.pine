@@ -59,7 +59,7 @@ useStop        = input.bool(true,  "Use Stop Loss",                   group="Str
 stopUnit       = input.string("Points", "Stop loss units", ["Points", "Percent"], group="Strategy", tooltip="Points = a fixed point distance. Percent = a % of the entry (avg) price, so the stop scales with price across a long backtest (275 pts at ~30k ~ 0.9%).")
 stopPts        = input.float(275,  "Stop Loss (points)", minval=1,    group="Strategy")
 stopPct        = input.float(0.89,  "Stop Loss (% of entry)", minval=0.01, group="Strategy")
-useTrailStop   = input.bool(false, "Trail Stop to Last TP Increment", group="Strategy", tooltip="Once the Stop Trail Day/Time is reached (in the Warning Timezone), the stop loss is tightened to the last confirmed TP increment reached in the trade's favor (e.g. the last 500-pt/1.66% level hit) - locking in that much of the move. The stop only ever tightens, never loosens.")
+useTrailStop   = input.bool(false, "Trail Stop to Breakeven + TP Increments", group="Strategy", tooltip="Once the Stop Trail Day/Time is reached (in the Warning Timezone), the stop loss moves to breakeven (entry price), then steps up in 500-pt/1.66% TP increments as each level is confirmed in the trade's favor. The stop only ever tightens, never loosens.")
 trailDay       = input.string("Thursday", "Stop Trail Day", options=dayOptions, group="Strategy")
 trailHour      = input.int(12,     "Stop Trail Hour",   minval=0, maxval=23, group="Strategy")
 trailMin       = input.int(0,      "Stop Trail Minute", minval=0, maxval=59, group="Strategy")
@@ -471,21 +471,26 @@ if inWarnWindow and not tradedWindow and not na(dir) and entryTrigger and xNewBa
 afterWindowEnd = wDow == warnEndDayInt and (wHour > warnEndHour or (wHour == warnEndHour and wMin >= warnEndMin))
 forceExit      = wDow == warnEndDayInt and (wHour > exitHour or (wHour == exitHour and wMin >= exitMin))
 
-// Trailing stop: once the Stop Trail Day/Time is reached, tighten the stop to the last confirmed TP
-// increment reached in the trade's favor (the last 500-pt/1.66% level hit), and never loosen it back.
+// Trailing stop: once the Stop Trail Day/Time is reached, move the stop to breakeven, then step it up
+// to each confirmed TP increment in the trade's favor (500-pt/1.66% steps) as price reaches them - so it
+// rises breakeven -> TP1 -> TP2 -> ... rather than jumping straight to whatever is already confirmed.
+// It only ever tightens, never loosens.
 trailDayInt    = dayNameToInt(trailDay)
 pastTrailTime  = wDow > trailDayInt or (wDow == trailDayInt and (wHour > trailHour or (wHour == trailHour and wMin >= trailMin)))
-float trailLevelLong  = confirmedUp > 0   ? wLow  + tpStepUpMain * confirmedUp   : na
-float trailLevelShort = confirmedDown > 0 ? wHigh - tpStepDnMain * confirmedDown : na
+float trailLevelLong  = strategy.position_avg_price
+float trailLevelShort = strategy.position_avg_price
+if confirmedUp > 0
+    trailLevelLong := math.max(trailLevelLong, wLow + tpStepUpMain * confirmedUp)
+if confirmedDown > 0
+    trailLevelShort := math.min(trailLevelShort, wHigh - tpStepDnMain * confirmedDown)
 
 // Stop loss - active at all times (a resting price-level order; fills at the stop price on any bar).
 // Distance is a fixed point amount, or a % of the entry (avg) price when Percent units are selected.
 float stopDist = stopUnit == "Percent" ? strategy.position_avg_price * stopPct / 100 : stopPts
 float longStopLevel  = strategy.position_avg_price - stopDist
 float shortStopLevel = strategy.position_avg_price + stopDist
-if useTrailStop and pastTrailTime and not na(trailLevelLong)
+if useTrailStop and pastTrailTime
     longStopLevel := math.max(longStopLevel, trailLevelLong)
-if useTrailStop and pastTrailTime and not na(trailLevelShort)
     shortStopLevel := math.min(shortStopLevel, trailLevelShort)
 if useStop and strategy.position_size > 0
     strategy.exit("Long Stop", from_entry="Long", stop=longStopLevel)

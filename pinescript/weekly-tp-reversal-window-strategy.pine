@@ -65,6 +65,7 @@ trailStepPct   = input.float(1.66, "Trail Step (% of price)", minval=0.01, group
 trailDay       = input.string("Thursday", "Stop Trail Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Strategy")
 trailHour      = input.int(12,     "Stop Trail Hour",   minval=0, maxval=23, group="Strategy")
 trailMin       = input.int(0,      "Stop Trail Minute", minval=0, maxval=59, group="Strategy")
+showTrailPlot  = input.bool(true, "Show Trailing Stop on Chart", group="Strategy", tooltip="Plots the live stop level (solid, steps up with the trail) and the trail's target level (dotted, where it's climbing toward) while a trade is open.")
 exitHour       = input.int(21,     "Force-exit hour (window-end day)",   minval=0, maxval=23, group="Strategy", tooltip="Latest exit on the Warning End Day, in the Warning Timezone. Any trade still open is closed at this time - no weekend hold. The TP can still exit earlier.")
 exitMin        = input.int(45,      "Force-exit minute (window-end day)", minval=0, maxval=59, group="Strategy")
 lockExecTf     = input.bool(true, "Lock execution to a fixed timeframe", group="Strategy", tooltip="On = read the entry, exit and reversal-window on a FIXED timeframe (below) via request.security, so changing the CHART timeframe no longer changes the results. Keep the chart at that timeframe or LOWER. Off (default) = use the chart's own bars - the behaviour that produced the tuned result.")
@@ -506,6 +507,15 @@ if useStop and strategy.position_size > 0
     strategy.exit("Long Stop", from_entry="Long", stop=longStopLevel)
 if useStop and strategy.position_size < 0
     strategy.exit("Short Stop", from_entry="Short", stop=shortStopLevel)
+
+// ---- Visualize the trailing stop on the chart ----
+// Solid line = the actual active stop (steps up/down as each Trail Step level is confirmed by a close).
+// Dotted line = the trail's current target level, visible even before the Stop Trail Day/Time arrives,
+// so you can see where it will jump to once trailing activates.
+plot(showTrailPlot and strategy.position_size > 0 ? longStopLevel  : na, title="Long Stop (incl. Trail)",  color=color.red, style=plot.style_linebr, linewidth=2)
+plot(showTrailPlot and strategy.position_size < 0 ? shortStopLevel : na, title="Short Stop (incl. Trail)", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(showTrailPlot and useTrailStop and strategy.position_size > 0 ? trailLevelLong  : na, title="Long Trail Target",  color=color.new(color.yellow, 40), style=plot.style_circles, linewidth=1)
+plot(showTrailPlot and useTrailStop and strategy.position_size < 0 ? trailLevelShort : na, title="Short Trail Target", color=color.new(color.yellow, 40), style=plot.style_circles, linewidth=1)
 
 // TP-flip exit - only from the window-end day's window-end time onward, assessed once per locked bar.
 if afterWindowEnd and xNewBar

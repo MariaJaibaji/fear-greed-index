@@ -474,16 +474,18 @@ afterWindowEnd = wDow == warnEndDayInt and (wHour > warnEndHour or (wHour == war
 forceExit      = wDow == warnEndDayInt and (wHour > exitHour or (wHour == exitHour and wMin >= exitMin))
 
 // Trailing stop: once the Stop Trail Day/Time is reached, move the stop to breakeven, then step it up
-// through Trail Step increments (own Points/Percent unit + amount, independent of the main TP Increment
-// settings) as price reaches them in the trade's favor - so it rises breakeven -> step 1 -> step 2 -> ...
-// rather than jumping straight to wherever price already is. It only ever tightens, never loosens.
+// through Trail Step increments (own Points/Percent unit + amount, default 500/1.66% - independent of the
+// main TP Increment settings) as price reaches them in the trade's favor. "Smart" confirmation mirrors the
+// Trend / Reversal Threshold logic (bearSignal/bullSignal above): it requires the CLOSE, not just a wick,
+// to have travelled that many steps past the weekly extreme, so a brief spike can't trail the stop and get
+// it stopped straight back out. It only ever tightens, never loosens.
 trailDayInt    = dayNameToInt(trailDay)
 pastTrailTime  = wDow > trailDayInt or (wDow == trailDayInt and (wHour > trailHour or (wHour == trailHour and wMin >= trailMin)))
 
 float trailStepUp = trailStepUnit == "Percent" and not na(wLow)  ? wLow  * trailStepPct / 100 : trailStepPts
 float trailStepDn = trailStepUnit == "Percent" and not na(wHigh) ? wHigh * trailStepPct / 100 : trailStepPts
-int trailStepsUp   = trailStepUp > 0 and not na(wHigh) and not na(wLow) ? int(math.floor((wHigh - wLow) / trailStepUp)) : 0
-int trailStepsDown = trailStepDn > 0 and not na(wHigh) and not na(wLow) ? int(math.floor((wHigh - wLow) / trailStepDn)) : 0
+int trailStepsUp   = trailStepUp > 0 and not na(wLow)  ? int(math.floor(math.max(xClose - wLow, 0) / trailStepUp)) : 0
+int trailStepsDown = trailStepDn > 0 and not na(wHigh) ? int(math.floor(math.max(wHigh - xClose, 0) / trailStepDn)) : 0
 
 float trailLevelLong  = strategy.position_avg_price
 float trailLevelShort = strategy.position_avg_price

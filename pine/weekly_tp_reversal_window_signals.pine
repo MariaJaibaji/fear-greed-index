@@ -267,6 +267,20 @@ float xClose  = lockExecTf ? sClose : close
 int   xTime   = lockExecTf ? sTime  : time
 bool  xNewBar = lockExecTf ? (ta.change(sTime) != 0) : true
 
+// ---- Timeframe-lock integrity check ----
+// request.security() can only pin calculations to calcTf / execLockTf if the CHART itself is at that
+// timeframe or a FINER one - if the chart is COARSER (e.g. viewing Daily while calcTf/execLockTf are
+// intraday), Pine can no longer see the intrabar detail those locks depend on, so the simulated trades
+// (and this table) will legitimately stop matching what you see at a locked-or-lower timeframe. This is
+// the single most common reason the numbers below change when you switch charts.
+tfMismatch = timeframe.in_seconds() > timeframe.in_seconds(calcTf) or (lockExecTf and timeframe.in_seconds() > timeframe.in_seconds(execLockTf))
+var label tfWarnLabel = na
+if barstate.islast
+    label.delete(tfWarnLabel)
+    if tfMismatch
+        warnTxt = "⚠ Chart timeframe is COARSER than the locked timeframe(s)\n(Calc: " + calcTf + (lockExecTf ? ", Exec: " + execLockTf : "") + ").\nSwitch the chart to that timeframe or lower, or raise the locked\ntimeframe(s) to match - otherwise trades/table won't line up."
+        tfWarnLabel := label.new(bar_index, high, warnTxt, style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.normal)
+
 // Effective TP increment / reversal threshold in the chart scope (same anchor-based rule as inside calc).
 float tpStepUpMain = tpUnit == "Percent" and not na(wLow)  ? wLow  * tpStepPct / 100 : tpStep
 float tpStepDnMain = tpUnit == "Percent" and not na(wHigh) ? wHigh * tpStepPct / 100 : tpStep
@@ -337,7 +351,7 @@ if showVP and barstate.islast and vpSize == vpRows * 2 and not na(vpTop) and not
 var line whLine = na
 var line wlLine = na
 var line woLine = na
-newWeekChart = ta.change(time("W")) != 0
+newWeekChart = ta.change(weekStartTime) != 0
 if showWeekLines and not na(wHigh)
     if na(whLine) or newWeekChart
         whLine := line.new(bar_index, wHigh, bar_index, wHigh, color=color.green, width=2)
@@ -400,7 +414,7 @@ inWarnWindow = afterStart and beforeEnd
 
 // Colour locked to the trend entering the window: bearish -> green (reversal up), bullish -> red (reversal down).
 var string warnTrend = na
-if ta.change(time("W")) != 0
+if ta.change(weekStartTime) != 0
     warnTrend := na
 if inWarnWindow and not inWarnWindow[1]
     warnTrend := mode
@@ -462,7 +476,7 @@ bool openOkShort = not na(weekOpen) and xClose > weekOpen * (1 - openTolPct / 10
 // Exit-timing gates.
 afterWindowEnd = wDow == dayofweek.friday and (wHour > warnEndHour or (wHour == warnEndHour and wMin >= warnEndMin))
 forceExit      = wDow == dayofweek.friday and (wHour > exitHour or (wHour == exitHour and wMin >= exitMin))
-weekRollover   = ta.change(time("W")) != 0
+weekRollover   = ta.change(weekStartTime) != 0
 
 // Simulated position: 0 flat, 1 long, -1 short.
 var int    posDir   = 0
@@ -600,13 +614,18 @@ if showPerfTable and barstate.islast
     totalPnlDollar = equity - startupCapital
     totalPnlPct    = startupCapital > 0 ? totalPnlDollar / startupCapital * 100 : 0.0
 
-    nRows = 1 + (showTotalPnl ? 1 : 0) + (showProfitFactor ? 1 : 0) + (showWinRate ? 1 : 0) + (showMaxDD ? 1 : 0)
+    nRows = 2 + (showTotalPnl ? 1 : 0) + (showProfitFactor ? 1 : 0) + (showWinRate ? 1 : 0) + (showMaxDD ? 1 : 0)
     perfTable := table.new(perfTablePosition, 2, math.max(nRows, 1), bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray, frame_color=color.gray, frame_width=1)
 
     table.cell(perfTable, 0, 0, "Performance", text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=perfTextSize, text_halign=text.align_left)
     table.cell(perfTable, 1, 0, str.tostring(totalTrades) + " trades", text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=perfTextSize, text_halign=text.align_right)
 
-    row = 1
+    lockText  = "Calc " + calcTf + (lockExecTf ? " / Exec " + execLockTf : " (exec unlocked)")
+    lockColor = tfMismatch ? color.red : color.silver
+    table.cell(perfTable, 0, 1, "Locked TF", text_color=color.gray, text_size=perfTextSize, text_halign=text.align_left)
+    table.cell(perfTable, 1, 1, lockText, text_color=lockColor, text_size=perfTextSize, text_halign=text.align_right)
+
+    row = 2
     if showTotalPnl
         pnlColor = totalPnlDollar >= 0 ? color.lime : color.red
         pnlText  = (totalPnlDollar >= 0 ? "+$" : "-$") + formatPrice(math.abs(totalPnlDollar)) + " (" + (totalPnlPct >= 0 ? "+" : "") + str.tostring(totalPnlPct, "#.##") + "%)"

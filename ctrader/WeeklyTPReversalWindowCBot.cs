@@ -123,8 +123,17 @@ namespace cAlgo.Robots
         [Parameter("Weekly-Open Tolerance %", DefaultValue = 0.0, MinValue = 0, Group = "Strategy")]
         public double WeeklyOpenTolerancePercent { get; set; }
 
-        [Parameter("Trade Volume (lots)", DefaultValue = 0.01, MinValue = 0.01, Group = "Strategy")]
-        public double TradeVolumeLots { get; set; }
+        [Parameter("Risk % Of Equity Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
+            Description = "Position size is calculated from this % of current equity and the trade's actual stop-loss distance, so every trade risks the same amount regardless of how wide the stop is that week. Requires Use Stop Loss to be on.")]
+        public double RiskPercent { get; set; }
+
+        [Parameter("Max Position Size (lots)", DefaultValue = 5.0, MinValue = 0.01, Group = "Strategy",
+            Description = "Hard safety cap - the risk-% calculation is never allowed to size a position above this, even if the stop is unusually tight or the risk % / equity is mis-set.")]
+        public double MaxVolumeLots { get; set; }
+
+        [Parameter("Fallback Volume (lots) If Stop Loss Disabled", DefaultValue = 0.10, MinValue = 0.01, Group = "Strategy",
+            Description = "Risk-% sizing needs a stop-loss distance to size off. Used only when Use Stop Loss is off, since there's nothing to size risk against.")]
+        public double FallbackVolumeLots { get; set; }
 
         [Parameter("Use Stop Loss", DefaultValue = true, Group = "Strategy")]
         public bool UseStopLoss { get; set; }
@@ -463,7 +472,19 @@ namespace cAlgo.Robots
 
         private void OpenPosition(TradeType type, Bar xBar, string reason)
         {
-            double volumeInUnits = Symbol.NormalizeVolumeInUnits(Symbol.QuantityToVolumeInUnits(TradeVolumeLots));
+            // Volume must be decided BEFORE the order goes out, so the stop distance is estimated off the
+            // current market price (Ask for a buy, Bid for a sell). The real entry may differ slightly by
+            // spread/slippage - the stop itself is set from the actual fill price right after, in
+            // SetInitialStop(), so only the SIZE (not the stop level) relies on this estimate.
+            double estEntry = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
+            double estStopDist = UseStopLoss
+                ? (StopUnit == UnitType.Percent ? estEntry * StopLossPercent / 100.0 : StopLossPoints)
+                : 0;
+
+            double volumeInUnits = UseStopLoss && estStopDist > 0
+                ? CalculateVolume(estStopDist)
+                : Symbol.NormalizeVolumeInUnits(Symbol.QuantityToVolumeInUnits(FallbackVolumeLots));
+
             var result = ExecuteMarketOrder(type, SymbolName, volumeInUnits, PositionLabel, null, null, reason);
 
             if (!result.IsSuccessful || result.Position == null)
@@ -476,9 +497,33 @@ namespace cAlgo.Robots
             _stopTrailed = false;
             SetInitialStop();
 
-            Print(reason);
+            Print(reason + $" | Volume: {volumeInUnits} units");
             if (ShowReasons)
                 DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
+        }
+
+        // Sizes the position so that a stop-loss hit at `stopDistance` away from entry loses RiskPercent%
+        // of current equity, capped at MaxVolumeLots as a hard safety backstop.
+        private double CalculateVolume(double stopDistance)
+        {
+            if (stopDistance <= 0) return Symbol.VolumeInUnitsMin;
+
+            double riskAmount = Account.Equity * RiskPercent / 100.0;
+
+            double pips = stopDistance / Symbol.PipSize;
+            double riskPerLot = pips * Symbol.PipValue;
+            if (riskPerLot <= 0) return Symbol.VolumeInUnitsMin;
+
+            double lots = riskAmount / riskPerLot;
+            double volumeInUnits = lots * Symbol.LotSize;
+
+            double maxUnits = Symbol.QuantityToVolumeInUnits(MaxVolumeLots);
+            volumeInUnits = Math.Min(volumeInUnits, maxUnits);
+
+            volumeInUnits = Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down);
+            if (volumeInUnits < Symbol.VolumeInUnitsMin) volumeInUnits = Symbol.VolumeInUnitsMin;
+
+            return volumeInUnits;
         }
 
         private void SetInitialStop()

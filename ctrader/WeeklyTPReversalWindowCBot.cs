@@ -1,0 +1,623 @@
+// Weekly TP Reversal Window - cTrader cBot (cAlgo.API, C#)
+//
+// Port of the "Weekly TP Reversal Window Strategy" Pine Script to cTrader Automate. Same trading logic:
+// weekly high/low/open tracking, TP levels (Points or Percent of the weekly extreme), a reversal-window
+// day/time/timezone gate (with wrap-around support, e.g. Fri -> Mon), a proximity-based reversal/TP-sweep
+// entry trigger, a real broker-side stop loss, a "trail to breakeven then step through Trail Step
+// increments" trailing stop with close-based confirmation, a TP-flip exit, a force-exit at the window-end
+// day/time, and a week-rollover safety close. Entry/exit reasoning is attached as the position's comment
+// and drawn on the chart, matching the Pine version's labels.
+//
+// NOT ported: the Anchored Volume Profile (purely visual, no effect on trading decisions - skipped by
+// request to keep this file focused on the trading logic).
+//
+// Platform differences worth knowing before you trade this live:
+//   - The stop loss and trailing stop use a REAL broker-side stop order (Position.ModifyStopLossPrice),
+//     which is more accurate than the Pine indicator's simulated wick-check - the broker fills it exactly
+//     when hit, intrabar, same as any other stop order on this platform.
+//   - "Points" in every input below are RAW PRICE UNITS added to/subtracted from price (matching the Pine
+//     script, which was tuned on an index/crypto-style instrument), NOT pips and NOT Symbol.PipSize
+//     multiples. If your instrument's pip size differs from 1 price unit, re-tune the point-based inputs
+//     or switch to Percent mode.
+//   - "New week" is detected by a configurable WeekStartDay (default Monday) transition on the
+//     Calculation Timeframe, since Pine's time("W") week boundary can vary by exchange/instrument. Set it
+//     to match your instrument's actual weekly session start.
+//   - This file has not been compiled inside cTrader - the cAlgo API has shifted slightly across versions.
+//     Paste it into cTrader Automate; if the compiler flags a method/property name, it is almost always a
+//     one-line signature fix (e.g. an overload with a slightly different parameter list on your version).
+//
+// Build/test in the cTrader backtester before running on a live or demo account.
+
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Internals;
+
+namespace cAlgo.Robots
+{
+    public enum UnitType
+    {
+        Points,
+        Percent
+    }
+
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class WeeklyTPReversalWindowCBot : Robot
+    {
+        private const string PositionLabel = "WeeklyTPReversal";
+
+        // ---------------------------------------------------------------------------------------------
+        // Parameters
+        // ---------------------------------------------------------------------------------------------
+
+        [Parameter("TP / Threshold Units", DefaultValue = UnitType.Percent, Group = "TP Levels")]
+        public UnitType TpUnit { get; set; }
+
+        [Parameter("TP Increment (points)", DefaultValue = 500, MinValue = 1, Group = "TP Levels")]
+        public double TpStepPoints { get; set; }
+
+        [Parameter("TP Increment (% of price)", DefaultValue = 1.66, MinValue = 0.01, Group = "TP Levels")]
+        public double TpStepPercent { get; set; }
+
+        [Parameter("Number of TP Levels", DefaultValue = 9, MinValue = 1, MaxValue = 10, Group = "TP Levels")]
+        public int TpLevelsCount { get; set; }
+
+        [Parameter("Trend / Reversal Threshold (points)", DefaultValue = 250, MinValue = 1, Group = "TP Levels")]
+        public double TrendThresholdPoints { get; set; }
+
+        [Parameter("Trend / Reversal Threshold (% of price)", DefaultValue = 0.83, MinValue = 0.01, Group = "TP Levels")]
+        public double TrendThresholdPercent { get; set; }
+
+        [Parameter("Calculation Timeframe", DefaultValue = "Minute5", Group = "TP Levels")]
+        public TimeFrame CalcTimeFrame { get; set; }
+
+        [Parameter("Week Start Day", DefaultValue = DayOfWeek.Monday, Group = "TP Levels",
+            Description = "Which weekday the weekly high/low/open resets on. Pine's time(\"W\") boundary varies by exchange/instrument - set this to match yours.")]
+        public DayOfWeek WeekStartDay { get; set; }
+
+        [Parameter("Show Weekly High/Low/Open Lines", DefaultValue = true, Group = "TP Levels")]
+        public bool ShowWeekLines { get; set; }
+
+        [Parameter("Show Reversal Warning Background", DefaultValue = true, Group = "Reversal Warning")]
+        public bool ShowWarning { get; set; }
+
+        [Parameter("Warning Timezone (IANA or Windows id)", DefaultValue = "Europe/London", Group = "Reversal Warning",
+            Description = "e.g. 'Europe/London' (IANA) or 'GMT Standard Time' (Windows). Falls back to UTC with a log warning if not found on this system.")]
+        public string WarningTimeZoneId { get; set; }
+
+        [Parameter("Warning Start Day", DefaultValue = DayOfWeek.Wednesday, Group = "Reversal Warning")]
+        public DayOfWeek WarnStartDay { get; set; }
+
+        [Parameter("Warning Start Hour", DefaultValue = 13, MinValue = 0, MaxValue = 23, Group = "Reversal Warning")]
+        public int WarnStartHour { get; set; }
+
+        [Parameter("Warning Start Minute", DefaultValue = 15, MinValue = 0, MaxValue = 59, Group = "Reversal Warning")]
+        public int WarnStartMinute { get; set; }
+
+        [Parameter("Warning End Day", DefaultValue = DayOfWeek.Friday, Group = "Reversal Warning")]
+        public DayOfWeek WarnEndDay { get; set; }
+
+        [Parameter("Warning End Hour", DefaultValue = 9, MinValue = 0, MaxValue = 23, Group = "Reversal Warning")]
+        public int WarnEndHour { get; set; }
+
+        [Parameter("Warning End Minute", DefaultValue = 45, MinValue = 0, MaxValue = 59, Group = "Reversal Warning")]
+        public int WarnEndMinute { get; set; }
+
+        [Parameter("Trade Longs (bearish-into-window fade)", DefaultValue = true, Group = "Strategy")]
+        public bool EnableLongs { get; set; }
+
+        [Parameter("Trade Shorts (bullish-into-window fade)", DefaultValue = true, Group = "Strategy")]
+        public bool EnableShorts { get; set; }
+
+        [Parameter("Enter Only At A Reversal/TP Sweep", DefaultValue = true, Group = "Strategy")]
+        public bool UseTPEntry { get; set; }
+
+        [Parameter("Also Enter At The Reversal Threshold", DefaultValue = false, Group = "Strategy",
+            Description = "On = the shallow reversal-threshold touch (e.g. ~250pt/0.83%) can trigger the entry, not just a full TP level.")]
+        public bool EntryAtReversal { get; set; }
+
+        [Parameter("Entry Proximity %", DefaultValue = 0.088, MinValue = 0.01, Group = "Strategy",
+            Description = "How close (as a % of price) the exec bar's wick must come to a level to trigger the entry.")]
+        public double EntryProximityPercent { get; set; }
+
+        [Parameter("Weekly-Open Tolerance %", DefaultValue = 0.0, MinValue = 0, Group = "Strategy")]
+        public double WeeklyOpenTolerancePercent { get; set; }
+
+        [Parameter("Trade Volume (lots)", DefaultValue = 0.01, MinValue = 0.01, Group = "Strategy")]
+        public double TradeVolumeLots { get; set; }
+
+        [Parameter("Use Stop Loss", DefaultValue = true, Group = "Strategy")]
+        public bool UseStopLoss { get; set; }
+
+        [Parameter("Stop Loss Units", DefaultValue = UnitType.Points, Group = "Strategy")]
+        public UnitType StopUnit { get; set; }
+
+        [Parameter("Stop Loss (points)", DefaultValue = 275, MinValue = 1, Group = "Strategy")]
+        public double StopLossPoints { get; set; }
+
+        [Parameter("Stop Loss (% of entry)", DefaultValue = 0.89, MinValue = 0.01, Group = "Strategy")]
+        public double StopLossPercent { get; set; }
+
+        [Parameter("Trail Stop To Breakeven + Step Increments", DefaultValue = false, Group = "Strategy")]
+        public bool UseTrailStop { get; set; }
+
+        [Parameter("Trail Step Units", DefaultValue = UnitType.Points, Group = "Strategy")]
+        public UnitType TrailStepUnit { get; set; }
+
+        [Parameter("Trail Step (points)", DefaultValue = 500, MinValue = 1, Group = "Strategy")]
+        public double TrailStepPoints { get; set; }
+
+        [Parameter("Trail Step (% of price)", DefaultValue = 1.66, MinValue = 0.01, Group = "Strategy")]
+        public double TrailStepPercent { get; set; }
+
+        [Parameter("Stop Trail Day", DefaultValue = DayOfWeek.Thursday, Group = "Strategy")]
+        public DayOfWeek TrailDay { get; set; }
+
+        [Parameter("Stop Trail Hour", DefaultValue = 12, MinValue = 0, MaxValue = 23, Group = "Strategy")]
+        public int TrailHour { get; set; }
+
+        [Parameter("Stop Trail Minute", DefaultValue = 0, MinValue = 0, MaxValue = 59, Group = "Strategy")]
+        public int TrailMinute { get; set; }
+
+        [Parameter("Show Entry/Exit Reasoning Labels", DefaultValue = true, Group = "Strategy")]
+        public bool ShowReasons { get; set; }
+
+        [Parameter("Force-Exit Hour (window-end day)", DefaultValue = 21, MinValue = 0, MaxValue = 23, Group = "Strategy")]
+        public int ExitHour { get; set; }
+
+        [Parameter("Force-Exit Minute (window-end day)", DefaultValue = 45, MinValue = 0, MaxValue = 59, Group = "Strategy")]
+        public int ExitMinute { get; set; }
+
+        [Parameter("Lock Execution To A Fixed Timeframe", DefaultValue = true, Group = "Strategy",
+            Description = "On = evaluate entries/exits/window off a fixed timeframe below, so changing the chart timeframe doesn't change results. Off = evaluate on every tick using this chart's own bars.")]
+        public bool LockExecutionTimeframe { get; set; }
+
+        [Parameter("Locked Execution Timeframe", DefaultValue = "Minute15", Group = "Strategy")]
+        public TimeFrame ExecutionTimeFrame { get; set; }
+
+        // ---------------------------------------------------------------------------------------------
+        // State
+        // ---------------------------------------------------------------------------------------------
+
+        private Bars _calcBars;
+        private Bars _execBars;
+        private TimeZoneInfo _warnTz;
+
+        private DateTime? _lastWeekAnchor;
+        private double _weekHigh = double.NaN;
+        private double _weekLow = double.NaN;
+        private double _weekOpen = double.NaN;
+        private string _mode; // "up", "down", or null
+        private double _tpStepUp, _tpStepDn, _threshUp, _threshDn;
+
+        private bool _inWarnWindowPrev;
+        private string _warnTrend; // captured direction entering the window
+        private bool _tradedWindow;
+
+        private Position _openPosition;
+        private bool _stopTrailed;
+
+        private int _objCounter;
+
+        // ---------------------------------------------------------------------------------------------
+        // Lifecycle
+        // ---------------------------------------------------------------------------------------------
+
+        protected override void OnStart()
+        {
+            _warnTz = ResolveTimeZone(WarningTimeZoneId);
+
+            _calcBars = MarketData.GetBars(CalcTimeFrame, SymbolName);
+            _calcBars.BarOpened += OnCalcBarOpened;
+
+            if (LockExecutionTimeframe)
+            {
+                _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
+                _execBars.BarOpened += OnExecBarOpened;
+            }
+
+            Positions.Closed += OnPositionsClosed;
+
+            // Recover an already-open position if the cBot was restarted mid-trade.
+            _openPosition = Positions.FirstOrDefault(p => p.SymbolName == SymbolName && p.Label == PositionLabel);
+            if (_openPosition != null)
+            {
+                _tradedWindow = true;
+                Print("Recovered an existing open position on start: " + _openPosition.TradeType);
+            }
+        }
+
+        protected override void OnBar()
+        {
+            if (LockExecutionTimeframe) return; // driven by OnExecBarOpened instead
+            if (Bars.Count < 2) return;
+            EvaluateTradingLogic(Bars.Last(1));
+        }
+
+        protected override void OnStop()
+        {
+            if (_calcBars != null) _calcBars.BarOpened -= OnCalcBarOpened;
+            if (_execBars != null) _execBars.BarOpened -= OnExecBarOpened;
+            Positions.Closed -= OnPositionsClosed;
+        }
+
+        private void OnExecBarOpened(BarOpenedEventArgs args)
+        {
+            if (_execBars.Count < 2) return;
+            EvaluateTradingLogic(_execBars.Last(1));
+        }
+
+        private TimeZoneInfo ResolveTimeZone(string id)
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById(id);
+            }
+            catch (Exception)
+            {
+                Print($"Warning: timezone '{id}' not found on this system - falling back to UTC. " +
+                      "Try an IANA id like 'Europe/London' or a Windows id like 'GMT Standard Time'.");
+                return TimeZoneInfo.Utc;
+            }
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Weekly high/low/open + TP-level tracking (runs on each closed Calculation Timeframe bar)
+        // ---------------------------------------------------------------------------------------------
+
+        private void OnCalcBarOpened(BarOpenedEventArgs args)
+        {
+            if (_calcBars.Count < 2) return;
+            ProcessCalcBar(_calcBars.Last(1));
+        }
+
+        private bool IsNewWeek(DateTime barOpenTimeUtc)
+        {
+            DateTime anchor = barOpenTimeUtc.Date;
+            while (anchor.DayOfWeek != WeekStartDay) anchor = anchor.AddDays(-1);
+
+            bool isNew = _lastWeekAnchor == null || anchor != _lastWeekAnchor.Value;
+            _lastWeekAnchor = anchor;
+            return isNew;
+        }
+
+        private void ProcessCalcBar(Bar bar)
+        {
+            bool newWeek = IsNewWeek(bar.OpenTime);
+
+            if (newWeek || double.IsNaN(_weekHigh))
+            {
+                // A lingering position across a week boundary is a safety-net close, same as the Pine
+                // script's week-rollover fallback (the force-exit on the window-end day should normally
+                // have already closed it).
+                if (_openPosition != null)
+                    CloseWithReason("Week rollover - safety close", bar.Close, bar.OpenTime);
+
+                _weekHigh = bar.High;
+                _weekLow = bar.Low;
+                _weekOpen = bar.Open;
+                _mode = null;
+                _warnTrend = null;
+            }
+            else
+            {
+                if (bar.High > _weekHigh) _weekHigh = bar.High;
+                if (bar.Low < _weekLow) _weekLow = bar.Low;
+            }
+
+            // Effective TP increment / trend threshold - Percent mode is an exact % of the relevant
+            // weekly extreme, so levels stay proportional across a long backtest.
+            _tpStepUp = TpUnit == UnitType.Percent && !double.IsNaN(_weekLow) ? _weekLow * TpStepPercent / 100.0 : TpStepPoints;
+            _tpStepDn = TpUnit == UnitType.Percent && !double.IsNaN(_weekHigh) ? _weekHigh * TpStepPercent / 100.0 : TpStepPoints;
+            _threshUp = TpUnit == UnitType.Percent && !double.IsNaN(_weekLow) ? _weekLow * TrendThresholdPercent / 100.0 : TrendThresholdPoints;
+            _threshDn = TpUnit == UnitType.Percent && !double.IsNaN(_weekHigh) ? _weekHigh * TrendThresholdPercent / 100.0 : TrendThresholdPoints;
+
+            // Trend / reversal, both sides, always. (Note: the Pine script also tracks a legHigh/legLow +
+            // confirmedUp/confirmedDown "TP hit count" here, but that machinery only ever feeds its TP-level
+            // chart labels - it has no effect on any entry/exit decision - so it's intentionally left out of
+            // this port along with the rest of the skipped visuals.)
+            bool bearSignal = !double.IsNaN(_weekHigh) && !double.IsNaN(_weekLow) && bar.Close <= _weekHigh - _threshDn;
+            bool bullSignal = !double.IsNaN(_weekHigh) && !double.IsNaN(_weekLow) && bar.Close >= _weekLow + _threshUp;
+
+            if (bullSignal && !bearSignal) _mode = "up";
+            else if (bearSignal && !bullSignal) _mode = "down";
+
+            if (ShowWeekLines) DrawWeekLines(bar.OpenTime);
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Reversal window
+        // ---------------------------------------------------------------------------------------------
+
+        private (bool inWindow, DayOfWeek dow, int hour, int minute) GetWindowState(DateTime timeUtc)
+        {
+            DateTime local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(timeUtc, DateTimeKind.Utc), _warnTz);
+            DayOfWeek dow = local.DayOfWeek;
+            int hour = local.Hour;
+            int minute = local.Minute;
+
+            int startIdx = (int)WarnStartDay;
+            int endIdx = (int)WarnEndDay;
+            int curIdx = (int)dow;
+
+            bool afterStart = curIdx > startIdx || (curIdx == startIdx && (hour > WarnStartHour || (hour == WarnStartHour && minute >= WarnStartMinute)));
+            bool beforeEnd = curIdx < endIdx || (curIdx == endIdx && (hour < WarnEndHour || (hour == WarnEndHour && minute < WarnEndMinute)));
+
+            // Normal window (start day on/before end day): both must hold. Wrapping window (start day
+            // after end day, e.g. Fri -> Mon): either holds.
+            bool inWindow = startIdx <= endIdx ? (afterStart && beforeEnd) : (afterStart || beforeEnd);
+            return (inWindow, dow, hour, minute);
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Entry / exit orchestration (runs once per locked exec bar, or every chart bar when unlocked)
+        // ---------------------------------------------------------------------------------------------
+
+        private void EvaluateTradingLogic(Bar xBar)
+        {
+            if (double.IsNaN(_weekHigh) || double.IsNaN(_weekLow)) return;
+
+            var (inWindow, dow, hour, minute) = GetWindowState(xBar.OpenTime);
+
+            bool windowStart = inWindow && !_inWarnWindowPrev;
+            if (windowStart)
+            {
+                _tradedWindow = false;
+                _warnTrend = _mode;
+                if (ShowWarning) DrawWindowMarkers(xBar.OpenTime, _warnTrend);
+            }
+
+            string dir = _warnTrend ?? _mode;
+
+            // Reversal/TP-sweep proximity entry gate - first (shallowest) match wins.
+            bool nearTP = false;
+            string nearReason = null;
+            if (dir == "down")
+            {
+                if (EntryAtReversal)
+                {
+                    double rlvl = _weekHigh - _threshDn;
+                    if (rlvl > 0 && Math.Abs(xBar.Low - rlvl) <= rlvl * EntryProximityPercent / 100.0)
+                    {
+                        nearTP = true;
+                        nearReason = $"reversal threshold ({_threshDn:F0}pt) off weekly high, touched {rlvl:F2}";
+                    }
+                }
+                for (int i = 1; i <= TpLevelsCount && nearReason == null; i++)
+                {
+                    double lvl = _weekHigh - _tpStepDn * i;
+                    if (lvl > 0 && Math.Abs(xBar.Low - lvl) <= lvl * EntryProximityPercent / 100.0)
+                    {
+                        nearTP = true;
+                        nearReason = $"TP{i} sweep ({_tpStepDn * i:F0}pt) off weekly high, touched {lvl:F2}";
+                    }
+                }
+            }
+            else if (dir == "up")
+            {
+                if (EntryAtReversal)
+                {
+                    double rlvl = _weekLow + _threshUp;
+                    if (rlvl > 0 && Math.Abs(xBar.High - rlvl) <= rlvl * EntryProximityPercent / 100.0)
+                    {
+                        nearTP = true;
+                        nearReason = $"reversal threshold ({_threshUp:F0}pt) off weekly low, touched {rlvl:F2}";
+                    }
+                }
+                for (int i = 1; i <= TpLevelsCount && nearReason == null; i++)
+                {
+                    double lvl = _weekLow + _tpStepUp * i;
+                    if (lvl > 0 && Math.Abs(xBar.High - lvl) <= lvl * EntryProximityPercent / 100.0)
+                    {
+                        nearTP = true;
+                        nearReason = $"TP{i} sweep ({_tpStepUp * i:F0}pt) off weekly low, touched {lvl:F2}";
+                    }
+                }
+            }
+            bool entryTrigger = UseTPEntry ? nearTP : true;
+
+            bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
+            bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
+
+            if (inWindow && !_tradedWindow && _openPosition == null && dir != null && entryTrigger)
+            {
+                if (dir == "down" && EnableLongs && openOkLong)
+                {
+                    string reason = "LONG - bearish into window, reversal UP: " +
+                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)");
+                    OpenPosition(TradeType.Buy, xBar, reason);
+                    _tradedWindow = true;
+                }
+                else if (dir == "up" && EnableShorts && openOkShort)
+                {
+                    string reason = "SHORT - bullish into window, reversal DOWN: " +
+                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)");
+                    OpenPosition(TradeType.Sell, xBar, reason);
+                    _tradedWindow = true;
+                }
+            }
+
+            // ---- Exit ----
+            bool afterWindowEnd = dow == WarnEndDay && (hour > WarnEndHour || (hour == WarnEndHour && minute >= WarnEndMinute));
+            bool forceExit = dow == WarnEndDay && (hour > ExitHour || (hour == ExitHour && minute >= ExitMinute));
+
+            UpdateTrailingStop(xBar, dow, hour, minute);
+
+            if (_openPosition != null && afterWindowEnd)
+            {
+                if (_openPosition.TradeType == TradeType.Buy && _mode == "down")
+                    CloseWithReason("LONG exit - trend flipped DOWN (up-TP became resistance)", xBar.Close, xBar.OpenTime);
+                else if (_openPosition.TradeType == TradeType.Sell && _mode == "up")
+                    CloseWithReason("SHORT exit - trend flipped UP (down-TP became support)", xBar.Close, xBar.OpenTime);
+            }
+
+            if (_openPosition != null && forceExit)
+                CloseWithReason("Force exit - window-end time reached, no weekend hold", xBar.Close, xBar.OpenTime);
+
+            _inWarnWindowPrev = inWindow;
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Position management
+        // ---------------------------------------------------------------------------------------------
+
+        private void OpenPosition(TradeType type, Bar xBar, string reason)
+        {
+            double volumeInUnits = Symbol.NormalizeVolumeInUnits(Symbol.QuantityToVolumeInUnits(TradeVolumeLots));
+            var result = ExecuteMarketOrder(type, SymbolName, volumeInUnits, PositionLabel, null, null, reason);
+
+            if (!result.IsSuccessful || result.Position == null)
+            {
+                Print("Entry failed: " + result.Error);
+                return;
+            }
+
+            _openPosition = result.Position;
+            _stopTrailed = false;
+            SetInitialStop();
+
+            Print(reason);
+            if (ShowReasons)
+                DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
+        }
+
+        private void SetInitialStop()
+        {
+            if (!UseStopLoss || _openPosition == null) return;
+
+            double entry = _openPosition.EntryPrice;
+            double dist = StopUnit == UnitType.Percent ? entry * StopLossPercent / 100.0 : StopLossPoints;
+            double level = _openPosition.TradeType == TradeType.Buy ? entry - dist : entry + dist;
+            _openPosition.ModifyStopLossPrice(level);
+        }
+
+        private void UpdateTrailingStop(Bar xBar, DayOfWeek dow, int hour, int minute)
+        {
+            if (_openPosition == null || !UseStopLoss || !UseTrailStop) return;
+
+            int trailIdx = (int)TrailDay;
+            int curIdx = (int)dow;
+            bool pastTrailTime = curIdx > trailIdx || (curIdx == trailIdx && (hour > TrailHour || (hour == TrailHour && minute >= TrailMinute)));
+            if (!pastTrailTime) return;
+
+            double entry = _openPosition.EntryPrice;
+            double trailStepUp = TrailStepUnit == UnitType.Percent && !double.IsNaN(_weekLow) ? _weekLow * TrailStepPercent / 100.0 : TrailStepPoints;
+            double trailStepDn = TrailStepUnit == UnitType.Percent && !double.IsNaN(_weekHigh) ? _weekHigh * TrailStepPercent / 100.0 : TrailStepPoints;
+
+            double? currentSL = _openPosition.StopLoss;
+
+            if (_openPosition.TradeType == TradeType.Buy)
+            {
+                // "Smart" confirmation: requires the CLOSE, not just a wick, to have travelled that many
+                // steps past the weekly low - mirrors the close-based reversal-threshold logic above.
+                int steps = trailStepUp > 0 ? (int)Math.Floor(Math.Max(xBar.Close - _weekLow, 0) / trailStepUp) : 0;
+                double target = entry; // breakeven baseline
+                if (steps > 0) target = Math.Max(target, _weekLow + trailStepUp * steps);
+
+                if (currentSL == null || target > currentSL.Value)
+                {
+                    _openPosition.ModifyStopLossPrice(target);
+                    _stopTrailed = true;
+                    if (ShowReasons) DrawTrailMarker(xBar, target);
+                }
+            }
+            else
+            {
+                int steps = trailStepDn > 0 ? (int)Math.Floor(Math.Max(_weekHigh - xBar.Close, 0) / trailStepDn) : 0;
+                double target = entry;
+                if (steps > 0) target = Math.Min(target, _weekHigh - trailStepDn * steps);
+
+                if (currentSL == null || target < currentSL.Value)
+                {
+                    _openPosition.ModifyStopLossPrice(target);
+                    _stopTrailed = true;
+                    if (ShowReasons) DrawTrailMarker(xBar, target);
+                }
+            }
+        }
+
+        private void CloseWithReason(string reason, double price, DateTime time)
+        {
+            if (_openPosition == null) return;
+
+            Print(reason);
+            if (ShowReasons)
+                DrawReasonLabel(reason, time, price, _openPosition.TradeType != TradeType.Buy, Color.Orange);
+
+            ClosePosition(_openPosition);
+            _openPosition = null;
+            _stopTrailed = false;
+        }
+
+        // Catches broker-triggered stop-loss fills (we didn't call ClosePosition ourselves for those).
+        private void OnPositionsClosed(PositionClosedEventArgs args)
+        {
+            if (args.Position.Label != PositionLabel || args.Position.SymbolName != SymbolName) return;
+            if (args.Reason != PositionCloseReason.StopLoss) return; // manual closes are already logged at the call site
+
+            string reason = _stopTrailed
+                ? $"Trailing stop hit @ {args.Position.StopLoss:F2} (locked-in profit)"
+                : $"Stop loss hit @ {args.Position.StopLoss:F2}";
+
+            Print(reason);
+            if (ShowReasons)
+                DrawReasonLabel(reason, Server.TimeInUtc, args.Position.StopLoss ?? 0, args.Position.TradeType != TradeType.Buy, Color.Red);
+
+            if (_openPosition != null && _openPosition.Id == args.Position.Id)
+            {
+                _openPosition = null;
+                _stopTrailed = false;
+            }
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Chart drawing
+        // ---------------------------------------------------------------------------------------------
+
+        private void DrawReasonLabel(string text, DateTime time, double price, bool above, Color color)
+        {
+            string name = "Reason_" + _objCounter++;
+            var label = Chart.DrawText(name, text, time, price, color);
+            label.VerticalAlignment = above ? VerticalAlignment.Top : VerticalAlignment.Bottom;
+            label.HorizontalAlignment = HorizontalAlignment.Center;
+        }
+
+        private void DrawTrailMarker(Bar xBar, double level)
+        {
+            string name = "Trail_" + _objCounter++;
+            Chart.DrawTrendLine(name, xBar.OpenTime, level, xBar.OpenTime.AddMinutes(1), level, Color.Yellow, 1, LineStyle.Dots);
+        }
+
+        private void DrawWindowMarkers(DateTime windowStartUtc, string trend)
+        {
+            // Pine's per-bar bgcolor tint has no direct cBot equivalent, so the window is marked with a
+            // pair of vertical lines (start/end) instead - colored the same way: bearish-into-window
+            // (green, reversal UP expected -> LONG fade) or bullish-into-window (red, reversal DOWN
+            // expected -> SHORT fade).
+            DateTime localStart = TimeZoneInfo.ConvertTimeFromUtc(windowStartUtc, _warnTz);
+            DateTime localEndDay = localStart.Date;
+            while (localEndDay.DayOfWeek != WarnEndDay) localEndDay = localEndDay.AddDays(1);
+            DateTime localEnd = localEndDay.AddHours(WarnEndHour).AddMinutes(WarnEndMinute);
+            if (localEnd <= localStart) localEnd = localEnd.AddDays(7);
+            DateTime endUtc = TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(localEnd, DateTimeKind.Unspecified), _warnTz);
+
+            Color c = trend == "down" ? Color.Green : trend == "up" ? Color.Red : Color.Gray;
+            Chart.RemoveObject("WarnStart");
+            Chart.RemoveObject("WarnEnd");
+            Chart.DrawVerticalLine("WarnStart", windowStartUtc, c, 1, LineStyle.Dots);
+            Chart.DrawVerticalLine("WarnEnd", endUtc, c, 1, LineStyle.Dots);
+        }
+
+        private void DrawWeekLines(DateTime weekBarTime)
+        {
+            Chart.RemoveObject("WeekHigh");
+            Chart.RemoveObject("WeekLow");
+            Chart.RemoveObject("WeekOpen");
+
+            var endTime = weekBarTime.AddDays(7);
+            Chart.DrawTrendLine("WeekHigh", weekBarTime, _weekHigh, endTime, _weekHigh, Color.Green, 2);
+            Chart.DrawTrendLine("WeekLow", weekBarTime, _weekLow, endTime, _weekLow, Color.Red, 2);
+            Chart.DrawTrendLine("WeekOpen", weekBarTime, _weekOpen, endTime, _weekOpen, Color.Yellow, 2);
+        }
+    }
+}

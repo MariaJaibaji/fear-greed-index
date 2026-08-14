@@ -127,21 +127,22 @@ if currMask != prevMask and currMask != 0
 
     n = array.size(levels)
     used = array.new_bool(n, false)
-    for i = 0 to n - 1 by 1
+    for i = 0 to n - 1
         if not array.get(used, i)
             array.set(used, i, true)
             lvlI = array.get(levels, i)
             sumLvl = lvlI
             cnt = 1
             txt = array.get(names, i)
-            for j = i + 1 to n - 1 by 1
-                if not array.get(used, j)
-                    lvlJ = array.get(levels, j)
-                    if math.abs(lvlJ - lvlI) / close * 100 <= groupPct
-                        array.set(used, j, true)
-                        sumLvl += lvlJ
-                        cnt += 1
-                        txt := txt + " + " + array.get(names, j)
+            if i < n - 1
+                for j = i + 1 to n - 1
+                    if not array.get(used, j)
+                        lvlJ = array.get(levels, j)
+                        if math.abs(lvlJ - lvlI) / close * 100 <= groupPct
+                            array.set(used, j, true)
+                            sumLvl += lvlJ
+                            cnt += 1
+                            txt := txt + " + " + array.get(names, j)
             avgLevel = sumLvl / cnt
             lblColor = cnt > 1 ? labelColorMulti : labelColorBase
             lblText = txt + " EMA " + str.tostring(ema1Len) + "/" + str.tostring(ema2Len) + "/" +

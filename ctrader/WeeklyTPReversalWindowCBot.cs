@@ -168,6 +168,14 @@ namespace cAlgo.Robots
         [Parameter("Stop Trail Minute", DefaultValue = 0, MinValue = 0, MaxValue = 59, Group = "Strategy")]
         public int TrailMinute { get; set; }
 
+        [Parameter("Take Profit At Confirmed TP Level", DefaultValue = false, Group = "Strategy",
+            Description = "Uses the SAME close-confirmation logic as the reversal threshold and trailing stop: exits once price CLOSES past the target TP increment (the level effectively becomes support/resistance), not on a raw price touch. Reuses the existing TP Increment step - no separate size to tune.")]
+        public bool UseTakeProfit { get; set; }
+
+        [Parameter("Take Profit Levels Ahead", DefaultValue = 1, MinValue = 1, MaxValue = 10, Group = "Strategy",
+            Description = "How many TP increments past the weekly extreme must be CLOSE-confirmed before taking profit. 1 = the very next level; higher = wait for a deeper, more confirmed move.")]
+        public int TakeProfitLevels { get; set; }
+
         [Parameter("Show Entry/Exit Reasoning Labels", DefaultValue = true, Group = "Strategy")]
         public bool ShowReasons { get; set; }
 
@@ -451,6 +459,7 @@ namespace cAlgo.Robots
             bool forceExit = dow == WarnEndDay && (hour > ExitHour || (hour == ExitHour && minute >= ExitMinute));
 
             UpdateTrailingStop(xBar, dow, hour, minute);
+            CheckTakeProfit(xBar);
 
             if (_openPosition != null && afterWindowEnd)
             {
@@ -577,6 +586,35 @@ namespace cAlgo.Robots
                     _openPosition.ModifyStopLossPrice(target);
                     _stopTrailed = true;
                     if (ShowReasons) DrawTrailMarker(xBar, target);
+                }
+            }
+        }
+
+        // Take profit using the SAME close-confirmation approach as the reversal threshold and the
+        // trailing stop: it doesn't fire on a raw price touch, it requires the CLOSE to have travelled
+        // TakeProfitLevels increments past the weekly extreme (i.e. that level has effectively become
+        // support/resistance), reusing the same TP Increment step as the main TP ladder. Always active
+        // once in a trade (not gated to the window-end, unlike the TP-flip exit below).
+        private void CheckTakeProfit(Bar xBar)
+        {
+            if (_openPosition == null || !UseTakeProfit) return;
+
+            if (_openPosition.TradeType == TradeType.Buy)
+            {
+                int steps = _tpStepUp > 0 ? (int)Math.Floor(Math.Max(xBar.Close - _weekLow, 0) / _tpStepUp) : 0;
+                if (steps >= TakeProfitLevels)
+                {
+                    double level = _weekLow + _tpStepUp * TakeProfitLevels;
+                    CloseWithReason($"Take profit - TP{TakeProfitLevels} confirmed by close (support formed @ {level:F2})", xBar.Close, xBar.OpenTime);
+                }
+            }
+            else
+            {
+                int steps = _tpStepDn > 0 ? (int)Math.Floor(Math.Max(_weekHigh - xBar.Close, 0) / _tpStepDn) : 0;
+                if (steps >= TakeProfitLevels)
+                {
+                    double level = _weekHigh - _tpStepDn * TakeProfitLevels;
+                    CloseWithReason($"Take profit - TP{TakeProfitLevels} confirmed by close (resistance formed @ {level:F2})", xBar.Close, xBar.OpenTime);
                 }
             }
         }

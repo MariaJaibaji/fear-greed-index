@@ -14,10 +14,12 @@
 //     stop distance, capped by a hard max-lots safety backstop.
 //   - Take Profit At Confirmed TP Level - a close-confirmed profit target using the same support/
 //     resistance-style confirmation as the trailing stop, reusing the existing TP Increment step.
-//   - EMA Trend Filter - EMA Fast (default 20) above EMA Slow (default 200) = bullish, longs only;
-//     Slow above Fast = bearish, shorts only. Computed on its own EMA Timeframe, independent of the
-//     Calculation/Execution timeframes - EMA Timeframe is itself a TimeFrame parameter, so cTrader's
-//     optimizer can sweep it directly to find which one reads the trend best for this instrument.
+//   - EMA Trend Filter - multi-timeframe confluence check (up to 3 independent timeframes, default
+//     H1/H4/Daily): on each enabled timeframe, EMA Fast (default 20) above EMA Slow (default 200) reads
+//     bullish, Slow above Fast reads bearish. A direction is only allowed once at least Minimum
+//     Timeframes Agreeing of the enabled timeframes agree on it. Each EMA Timeframe is its own TimeFrame
+//     parameter, and Minimum Timeframes Agreeing is a plain int, so both are directly optimizable -
+//     cTrader's optimizer can sweep which timeframes and how much agreement works best.
 //
 // NOT ported: the Anchored Volume Profile (purely visual, no effect on trading decisions - skipped by
 // request to keep this file focused on the trading logic).
@@ -40,6 +42,7 @@
 // Build/test in the cTrader backtester before running on a live or demo account.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using cAlgo.API;
 using cAlgo.API.Indicators;
@@ -116,18 +119,35 @@ namespace cAlgo.Robots
         public int WarnEndMinute { get; set; }
 
         [Parameter("Use EMA Trend Filter", DefaultValue = false, Group = "EMA Trend Filter",
-            Description = "Only takes trades aligned with the EMA trend: EMA Fast above EMA Slow = bullish (longs only), EMA Slow above EMA Fast = bearish (shorts only). Computed on its own EMA Timeframe, independent of the Calculation/Execution timeframes.")]
+            Description = "Only takes trades aligned with the EMA trend, checked across up to 3 independent timeframes: EMA Fast above EMA Slow = bullish, EMA Slow above EMA Fast = bearish. A direction is only allowed once at least Minimum Timeframes Agreeing of the enabled timeframes agree on it.")]
         public bool UseEmaTrendFilter { get; set; }
 
-        [Parameter("EMA Fast Period", DefaultValue = 20, MinValue = 1, Group = "EMA Trend Filter")]
+        [Parameter("EMA Fast Period", DefaultValue = 20, MinValue = 1, Group = "EMA Trend Filter",
+            Description = "Same Fast/Slow periods are used on every enabled EMA timeframe below.")]
         public int EmaFastPeriod { get; set; }
 
         [Parameter("EMA Slow Period", DefaultValue = 200, MinValue = 1, Group = "EMA Trend Filter")]
         public int EmaSlowPeriod { get; set; }
 
-        [Parameter("EMA Timeframe", DefaultValue = "Hour4", Group = "EMA Trend Filter",
-            Description = "The timeframe the EMAs are computed on. Directly optimizable as a TimeFrame parameter - sweep this to find which timeframe's trend read works best for this instrument.")]
-        public TimeFrame EmaTimeFrame { get; set; }
+        [Parameter("EMA Timeframe 1", DefaultValue = "Hour1", Group = "EMA Trend Filter",
+            Description = "Always active. Directly optimizable as a TimeFrame parameter.")]
+        public TimeFrame EmaTimeFrame1 { get; set; }
+
+        [Parameter("Use EMA Timeframe 2", DefaultValue = true, Group = "EMA Trend Filter")]
+        public bool UseEmaTimeFrame2 { get; set; }
+
+        [Parameter("EMA Timeframe 2", DefaultValue = "Hour4", Group = "EMA Trend Filter")]
+        public TimeFrame EmaTimeFrame2 { get; set; }
+
+        [Parameter("Use EMA Timeframe 3", DefaultValue = true, Group = "EMA Trend Filter")]
+        public bool UseEmaTimeFrame3 { get; set; }
+
+        [Parameter("EMA Timeframe 3", DefaultValue = "Daily", Group = "EMA Trend Filter")]
+        public TimeFrame EmaTimeFrame3 { get; set; }
+
+        [Parameter("Minimum Timeframes Agreeing", DefaultValue = 3, MinValue = 1, MaxValue = 3, Group = "EMA Trend Filter",
+            Description = "How many of the ENABLED EMA timeframes must agree on a direction before it's treated as a signal. 3 = strict confluence (all enabled timeframes must agree); 2 = majority; 1 = any single enabled timeframe is enough. If this exceeds the number of enabled timeframes, the filter will never produce a signal.")]
+        public int MinTimeframesAgreeing { get; set; }
 
         [Parameter("Trade Longs (bearish-into-window fade)", DefaultValue = true, Group = "Strategy")]
         public bool EnableLongs { get; set; }
@@ -225,9 +245,10 @@ namespace cAlgo.Robots
 
         private Bars _calcBars;
         private Bars _execBars;
-        private Bars _emaBars;
-        private ExponentialMovingAverage _emaFast;
-        private ExponentialMovingAverage _emaSlow;
+        private Bars _emaBars1, _emaBars2, _emaBars3;
+        private ExponentialMovingAverage _emaFast1, _emaSlow1;
+        private ExponentialMovingAverage _emaFast2, _emaSlow2;
+        private ExponentialMovingAverage _emaFast3, _emaSlow3;
         private TimeZoneInfo _warnTz;
 
         private DateTime? _lastWeekAnchor;
@@ -265,9 +286,27 @@ namespace cAlgo.Robots
 
             if (UseEmaTrendFilter)
             {
-                _emaBars = MarketData.GetBars(EmaTimeFrame, SymbolName);
-                _emaFast = Indicators.ExponentialMovingAverage(_emaBars.ClosePrices, EmaFastPeriod);
-                _emaSlow = Indicators.ExponentialMovingAverage(_emaBars.ClosePrices, EmaSlowPeriod);
+                _emaBars1 = MarketData.GetBars(EmaTimeFrame1, SymbolName);
+                _emaFast1 = Indicators.ExponentialMovingAverage(_emaBars1.ClosePrices, EmaFastPeriod);
+                _emaSlow1 = Indicators.ExponentialMovingAverage(_emaBars1.ClosePrices, EmaSlowPeriod);
+
+                if (UseEmaTimeFrame2)
+                {
+                    _emaBars2 = MarketData.GetBars(EmaTimeFrame2, SymbolName);
+                    _emaFast2 = Indicators.ExponentialMovingAverage(_emaBars2.ClosePrices, EmaFastPeriod);
+                    _emaSlow2 = Indicators.ExponentialMovingAverage(_emaBars2.ClosePrices, EmaSlowPeriod);
+                }
+
+                if (UseEmaTimeFrame3)
+                {
+                    _emaBars3 = MarketData.GetBars(EmaTimeFrame3, SymbolName);
+                    _emaFast3 = Indicators.ExponentialMovingAverage(_emaBars3.ClosePrices, EmaFastPeriod);
+                    _emaSlow3 = Indicators.ExponentialMovingAverage(_emaBars3.ClosePrices, EmaSlowPeriod);
+                }
+
+                int enabledCount = 1 + (UseEmaTimeFrame2 ? 1 : 0) + (UseEmaTimeFrame3 ? 1 : 0);
+                if (MinTimeframesAgreeing > enabledCount)
+                    Print($"Warning: Minimum Timeframes Agreeing ({MinTimeframesAgreeing}) is higher than the number of enabled EMA timeframes ({enabledCount}) - the EMA trend filter will never produce a signal.");
             }
 
             Positions.Closed += OnPositionsClosed;
@@ -407,20 +446,53 @@ namespace cAlgo.Robots
         // EMA trend filter
         // ---------------------------------------------------------------------------------------------
 
-        // EMA Fast above EMA Slow = bullish (only longs allowed); EMA Slow above EMA Fast = bearish (only
-        // shorts allowed). Computed on its own EMA Timeframe, independent of the chart/Calculation/
-        // Execution timeframes, so EMA Timeframe itself can be optimized to find which one reads best.
+        // Checks EMA Fast vs EMA Slow (same periods) independently on each ENABLED timeframe slot, then
+        // requires at least Minimum Timeframes Agreeing of them to agree on a direction before it counts
+        // as a signal - so it's a confluence check, not a single-timeframe read.
         private (string bias, string reason) GetEmaTrendBias()
         {
-            if (!UseEmaTrendFilter || _emaFast == null || _emaSlow == null) return (null, null);
+            if (!UseEmaTrendFilter) return (null, null);
 
-            double fast = _emaFast.Result.LastValue;
-            double slow = _emaSlow.Result.LastValue;
-            if (double.IsNaN(fast) || double.IsNaN(slow)) return (null, null);
+            var readings = new List<(string tf, string trend)>();
 
-            return fast >= slow
-                ? ("long", $"EMA trend ({EmaTimeFrame}): EMA{EmaFastPeriod} {fast:F2} >= EMA{EmaSlowPeriod} {slow:F2} - bullish, longs only")
-                : ("short", $"EMA trend ({EmaTimeFrame}): EMA{EmaSlowPeriod} {slow:F2} > EMA{EmaFastPeriod} {fast:F2} - bearish, shorts only");
+            string t1 = GetSingleEmaTrend(_emaFast1, _emaSlow1);
+            if (t1 != null) readings.Add((EmaTimeFrame1.ToString(), t1));
+
+            if (UseEmaTimeFrame2)
+            {
+                string t2 = GetSingleEmaTrend(_emaFast2, _emaSlow2);
+                if (t2 != null) readings.Add((EmaTimeFrame2.ToString(), t2));
+            }
+
+            if (UseEmaTimeFrame3)
+            {
+                string t3 = GetSingleEmaTrend(_emaFast3, _emaSlow3);
+                if (t3 != null) readings.Add((EmaTimeFrame3.ToString(), t3));
+            }
+
+            if (readings.Count == 0) return (null, null);
+
+            int longCount = readings.Count(r => r.trend == "long");
+            int shortCount = readings.Count(r => r.trend == "short");
+            string detail = string.Join(", ", readings.Select(r => $"{r.tf}={r.trend}"));
+
+            if (longCount >= MinTimeframesAgreeing)
+                return ("long", $"EMA confluence {longCount}/{readings.Count} bullish ({detail}) - longs only");
+            if (shortCount >= MinTimeframesAgreeing)
+                return ("short", $"EMA confluence {shortCount}/{readings.Count} bearish ({detail}) - shorts only");
+
+            return (null, null);
+        }
+
+        private string GetSingleEmaTrend(ExponentialMovingAverage fast, ExponentialMovingAverage slow)
+        {
+            if (fast == null || slow == null) return null;
+
+            double f = fast.Result.LastValue;
+            double s = slow.Result.LastValue;
+            if (double.IsNaN(f) || double.IsNaN(s)) return null;
+
+            return f >= s ? "long" : "short";
         }
 
         // ---------------------------------------------------------------------------------------------

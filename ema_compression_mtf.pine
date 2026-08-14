@@ -1,0 +1,125 @@
+//@version=5
+// EMA Compression Multi-Timeframe
+// Flags timeframes where EMA20/50/100/200 (lengths adjustable) are compressed
+// within a user-defined % of price, then prints one label per compressed
+// price level - merging labels from different timeframes when their levels
+// sit within a second, wider % tolerance of each other.
+indicator("EMA Compression Multi-Timeframe", shorttitle="EMA Compression MTF", overlay=true, max_labels_count=500)
+
+// ---------------- Inputs ----------------
+grpEMA = "EMA Lengths"
+ema1Len = input.int(20,  "EMA 1", minval=1, group=grpEMA)
+ema2Len = input.int(50,  "EMA 2", minval=1, group=grpEMA)
+ema3Len = input.int(100, "EMA 3", minval=1, group=grpEMA)
+ema4Len = input.int(200, "EMA 4", minval=1, group=grpEMA)
+
+grpComp = "Compression Settings"
+compressionPct = input.float(0.5, "Compression Range (% of price)", minval=0.01, step=0.05, group=grpComp,
+     tooltip="On a given timeframe, the 4 EMAs are considered 'compressed' when the distance between the highest and lowest EMA is within this % of price.")
+groupPct = input.float(1.0, "Merge Labels Within (% of price)", minval=0.01, step=0.05, group=grpComp,
+     tooltip="Compressed levels from different timeframes that fall within this % of each other are combined into a single label instead of stacking separate ones.")
+
+grpTF = "Timeframes"
+tf1Enable = input.bool(true,  "Enabled", inline="tf1", group=grpTF)
+tf1       = input.timeframe("", "Timeframe (blank = chart TF)", inline="tf1", group=grpTF)
+tf2Enable = input.bool(true,  "Enabled", inline="tf2", group=grpTF)
+tf2       = input.timeframe("15", "Timeframe", inline="tf2", group=grpTF)
+tf3Enable = input.bool(true,  "Enabled", inline="tf3", group=grpTF)
+tf3       = input.timeframe("60", "Timeframe", inline="tf3", group=grpTF)
+tf4Enable = input.bool(true,  "Enabled", inline="tf4", group=grpTF)
+tf4       = input.timeframe("240", "Timeframe", inline="tf4", group=grpTF)
+tf5Enable = input.bool(true,  "Enabled", inline="tf5", group=grpTF)
+tf5       = input.timeframe("D", "Timeframe", inline="tf5", group=grpTF)
+tf6Enable = input.bool(false, "Enabled", inline="tf6", group=grpTF)
+tf6       = input.timeframe("W", "Timeframe", inline="tf6", group=grpTF)
+
+grpStyle = "Label Style"
+labelOffset     = input.int(10, "Label Offset (bars to the right)", minval=0, group=grpStyle)
+labelSize       = input.string(size.small, "Label Size", options=[size.tiny, size.small, size.normal, size.large], group=grpStyle)
+labelTextColor  = input.color(color.white, "Label Text Color", group=grpStyle)
+labelColorBase  = input.color(color.new(color.blue, 0), "Label Color (single TF)", group=grpStyle)
+labelColorMulti = input.color(color.new(color.purple, 0), "Label Color (merged TFs)", group=grpStyle)
+
+// ---------------- Per-timeframe compression detection ----------------
+f_compression(tf, l1, l2, l3, l4, thresholdPct) =>
+    [e1, e2, e3, e4, c] = request.security(syminfo.tickerid, tf,
+         [ta.ema(close, l1), ta.ema(close, l2), ta.ema(close, l3), ta.ema(close, l4), close],
+         lookahead=barmerge.lookahead_off)
+    hi = math.max(math.max(e1, e2), math.max(e3, e4))
+    lo = math.min(math.min(e1, e2), math.min(e3, e4))
+    mid = (hi + lo) / 2
+    compressed = c != 0 and (hi - lo) / c * 100 <= thresholdPct
+    [compressed, mid]
+
+f_tfLabel(tf) => tf == "" ? timeframe.period : tf
+
+[c1, m1] = f_compression(tf1, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c2, m2] = f_compression(tf2, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c3, m3] = f_compression(tf3, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c4, m4] = f_compression(tf4, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c5, m5] = f_compression(tf5, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c6, m6] = f_compression(tf6, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+
+// ---------------- Alert (evaluated every bar) ----------------
+anyCompressedNow = (tf1Enable and c1) or (tf2Enable and c2) or (tf3Enable and c3) or
+     (tf4Enable and c4) or (tf5Enable and c5) or (tf6Enable and c6)
+alertcondition(anyCompressedNow and not anyCompressedNow[1], title="EMA Compression Started",
+     message="EMA compression detected on at least one timeframe")
+
+// ---------------- Label drawing (only needs the latest bar) ----------------
+var array<label> activeLabels = array.new<label>()
+
+if barstate.islast
+    if array.size(activeLabels) > 0
+        for i = 0 to array.size(activeLabels) - 1
+            label.delete(array.get(activeLabels, i))
+        array.clear(activeLabels)
+
+    levels = array.new_float()
+    names  = array.new_string()
+
+    if tf1Enable and c1
+        array.push(levels, m1)
+        array.push(names, f_tfLabel(tf1))
+    if tf2Enable and c2
+        array.push(levels, m2)
+        array.push(names, f_tfLabel(tf2))
+    if tf3Enable and c3
+        array.push(levels, m3)
+        array.push(names, f_tfLabel(tf3))
+    if tf4Enable and c4
+        array.push(levels, m4)
+        array.push(names, f_tfLabel(tf4))
+    if tf5Enable and c5
+        array.push(levels, m5)
+        array.push(names, f_tfLabel(tf5))
+    if tf6Enable and c6
+        array.push(levels, m6)
+        array.push(names, f_tfLabel(tf6))
+
+    n = array.size(levels)
+    if n > 0
+        used = array.new_bool(n, false)
+        for i = 0 to n - 1
+            if not array.get(used, i)
+                array.set(used, i, true)
+                lvlI = array.get(levels, i)
+                sumLvl = lvlI
+                cnt = 1
+                txt = array.get(names, i)
+                for j = i + 1 to n - 1
+                    if not array.get(used, j)
+                        lvlJ = array.get(levels, j)
+                        if math.abs(lvlJ - lvlI) / close * 100 <= groupPct
+                            array.set(used, j, true)
+                            sumLvl += lvlJ
+                            cnt += 1
+                            txt := txt + " + " + array.get(names, j)
+                avgLevel = sumLvl / cnt
+                lblColor = cnt > 1 ? labelColorMulti : labelColorBase
+                lblText = txt + " EMA " + str.tostring(ema1Len) + "/" + str.tostring(ema2Len) + "/" +
+                     str.tostring(ema3Len) + "/" + str.tostring(ema4Len) + " Compression\n" +
+                     str.tostring(avgLevel, format.mintick)
+                lbl = label.new(bar_index + labelOffset, avgLevel, lblText, xloc=xloc.bar_index,
+                     style=label.style_label_left, color=lblColor, textcolor=labelTextColor, size=labelSize)
+                array.push(activeLabels, lbl)

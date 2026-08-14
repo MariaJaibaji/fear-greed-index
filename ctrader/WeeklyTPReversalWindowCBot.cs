@@ -1,12 +1,23 @@
 // Weekly TP Reversal Window - cTrader cBot (cAlgo.API, C#)
 //
-// Port of the "Weekly TP Reversal Window Strategy" Pine Script to cTrader Automate. Same trading logic:
-// weekly high/low/open tracking, TP levels (Points or Percent of the weekly extreme), a reversal-window
-// day/time/timezone gate (with wrap-around support, e.g. Fri -> Mon), a proximity-based reversal/TP-sweep
-// entry trigger, a real broker-side stop loss, a "trail to breakeven then step through Trail Step
-// increments" trailing stop with close-based confirmation, a TP-flip exit, a force-exit at the window-end
-// day/time, and a week-rollover safety close. Entry/exit reasoning is attached as the position's comment
-// and drawn on the chart, matching the Pine version's labels.
+// Port of the "Weekly TP Reversal Window Strategy" Pine Script to cTrader Automate, plus a few cTrader-side
+// additions beyond the original Pine script (risk-based sizing, take profit, seasonal bias - see below).
+// Core trading logic: weekly high/low/open tracking, TP levels (Points or Percent of the weekly extreme),
+// a reversal-window day/time/timezone gate (with wrap-around support, e.g. Fri -> Mon), a proximity-based
+// reversal/TP-sweep entry trigger, a real broker-side stop loss, a "trail to breakeven then step through
+// Trail Step increments" trailing stop with close-based confirmation, a TP-flip exit, a force-exit at the
+// window-end day/time, and a week-rollover safety close. Entry/exit reasoning is attached as the
+// position's comment and drawn on the chart, matching the Pine version's labels.
+//
+// Added beyond the Pine script, specifically for cTrader (all optional, off by default unless noted):
+//   - Risk-% position sizing (on by default) - volume is calculated from equity and each trade's actual
+//     stop distance, capped by a hard max-lots safety backstop.
+//   - Take Profit At Confirmed TP Level - a close-confirmed profit target using the same support/
+//     resistance-style confirmation as the trailing stop, reusing the existing TP Increment step.
+//   - Seasonal Bias - an optional full directional flip by calendar month (two configurable "favor longs"
+//     windows, shorts-only outside them), optionally overridden by a Recent-Trend detector that compares
+//     this cBot's own closed-trade P&L by direction over a lookback window and lets live evidence trump
+//     the calendar assumption when the gap exceeds a configurable % of equity.
 //
 // NOT ported: the Anchored Volume Profile (purely visual, no effect on trading decisions - skipped by
 // request to keep this file focused on the trading logic).
@@ -29,6 +40,7 @@
 // Build/test in the cTrader backtester before running on a live or demo account.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using cAlgo.API;
 using cAlgo.API.Internals;
@@ -39,6 +51,12 @@ namespace cAlgo.Robots
     {
         Points,
         Percent
+    }
+
+    public enum Month
+    {
+        January = 1, February = 2, March = 3, April = 4, May = 5, June = 6,
+        July = 7, August = 8, September = 9, October = 10, November = 11, December = 12
     }
 
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
@@ -102,6 +120,33 @@ namespace cAlgo.Robots
 
         [Parameter("Warning End Minute", DefaultValue = 45, MinValue = 0, MaxValue = 59, Group = "Reversal Warning")]
         public int WarnEndMinute { get; set; }
+
+        [Parameter("Use Seasonal Bias", DefaultValue = false, Group = "Seasonal Bias",
+            Description = "Full flip: only longs are taken inside Window 1/Window 2, only shorts everywhere else. Overridden by the recent-trend detector below when that's on and triggers.")]
+        public bool UseSeasonalBias { get; set; }
+
+        [Parameter("Long Window 1 Start Month", DefaultValue = Month.April, Group = "Seasonal Bias")]
+        public Month SeasonalLongStartMonth1 { get; set; }
+
+        [Parameter("Long Window 1 End Month", DefaultValue = Month.June, Group = "Seasonal Bias")]
+        public Month SeasonalLongEndMonth1 { get; set; }
+
+        [Parameter("Long Window 2 Start Month", DefaultValue = Month.September, Group = "Seasonal Bias")]
+        public Month SeasonalLongStartMonth2 { get; set; }
+
+        [Parameter("Long Window 2 End Month", DefaultValue = Month.November, Group = "Seasonal Bias")]
+        public Month SeasonalLongEndMonth2 { get; set; }
+
+        [Parameter("Use Recent-Trend Override", DefaultValue = false, Group = "Seasonal Bias",
+            Description = "Tracks this cBot's own closed trades by direction over the lookback window. If one side's P&L beats the other by more than the % factor below (as a % of equity), that live evidence overrides the seasonal calendar bias - e.g. shorts significantly outperforming longs last week is treated as confirmation the macro trend is bearish, regardless of the month.")]
+        public bool UseRecentTrendDetection { get; set; }
+
+        [Parameter("Recent-Trend Lookback (days)", DefaultValue = 7, MinValue = 1, Group = "Seasonal Bias")]
+        public int RecentTrendLookbackDays { get; set; }
+
+        [Parameter("Recent-Trend Override Factor (% of equity)", DefaultValue = 1.0, MinValue = 0.01, Group = "Seasonal Bias",
+            Description = "How much one direction's recent P&L must beat the other's, as a % of current equity, before it's treated as significant enough to override the seasonal bias.")]
+        public double RecentTrendOverridePercent { get; set; }
 
         [Parameter("Trade Longs (bearish-into-window fade)", DefaultValue = true, Group = "Strategy")]
         public bool EnableLongs { get; set; }
@@ -213,6 +258,14 @@ namespace cAlgo.Robots
 
         private Position _openPosition;
         private bool _stopTrailed;
+
+        private class ClosedTradeRecord
+        {
+            public DateTime ClosedAtUtc;
+            public TradeType Direction;
+            public double NetProfit;
+        }
+        private readonly List<ClosedTradeRecord> _recentClosedTrades = new List<ClosedTradeRecord>();
 
         private int _objCounter;
 
@@ -436,19 +489,25 @@ namespace cAlgo.Robots
             bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
             bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
 
+            (string bias, string biasReason) = GetDirectionalBias(xBar.OpenTime);
+            bool longAllowed = EnableLongs && (bias == null || bias == "long");
+            bool shortAllowed = EnableShorts && (bias == null || bias == "short");
+
             if (inWindow && !_tradedWindow && _openPosition == null && dir != null && entryTrigger)
             {
-                if (dir == "down" && EnableLongs && openOkLong)
+                if (dir == "down" && longAllowed && openOkLong)
                 {
                     string reason = "LONG - bearish into window, reversal UP: " +
-                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)");
+                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)") +
+                                     (biasReason != null ? " | " + biasReason : "");
                     OpenPosition(TradeType.Buy, xBar, reason);
                     _tradedWindow = true;
                 }
-                else if (dir == "up" && EnableShorts && openOkShort)
+                else if (dir == "up" && shortAllowed && openOkShort)
                 {
                     string reason = "SHORT - bullish into window, reversal DOWN: " +
-                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)");
+                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)") +
+                                     (biasReason != null ? " | " + biasReason : "");
                     OpenPosition(TradeType.Sell, xBar, reason);
                     _tradedWindow = true;
                 }
@@ -619,6 +678,61 @@ namespace cAlgo.Robots
             }
         }
 
+        // ---------------------------------------------------------------------------------------------
+        // Seasonal / recent-trend directional bias
+        // ---------------------------------------------------------------------------------------------
+
+        // Returns the allowed direction ("long"/"short"), or null for no restriction, plus a human-
+        // readable reason to fold into the entry label. The recent-trend detector takes priority over the
+        // seasonal calendar bias when both are enabled and it has a significant enough signal, since it's
+        // live evidence rather than a static calendar assumption.
+        private (string bias, string reason) GetDirectionalBias(DateTime timeUtc)
+        {
+            if (UseRecentTrendDetection)
+            {
+                var (longPnl, shortPnl) = GetRecentPnL();
+                double threshold = Account.Equity * RecentTrendOverridePercent / 100.0;
+
+                if (shortPnl - longPnl >= threshold)
+                    return ("short", $"Recent-trend override: shorts {shortPnl:F0} vs longs {longPnl:F0} over last {RecentTrendLookbackDays}d");
+                if (longPnl - shortPnl >= threshold)
+                    return ("long", $"Recent-trend override: longs {longPnl:F0} vs shorts {shortPnl:F0} over last {RecentTrendLookbackDays}d");
+            }
+
+            if (UseSeasonalBias)
+            {
+                bool favorLong = InSeasonalLongWindow((Month)timeUtc.Month);
+                return favorLong
+                    ? ("long", $"Seasonal bias: LONG window ({SeasonalLongStartMonth1}-{SeasonalLongEndMonth1} / {SeasonalLongStartMonth2}-{SeasonalLongEndMonth2})")
+                    : ("short", "Seasonal bias: SHORT (outside long windows)");
+            }
+
+            return (null, null);
+        }
+
+        private bool InSeasonalLongWindow(Month month)
+        {
+            bool InRange(Month m, Month start, Month end) =>
+                start <= end ? m >= start && m <= end : m >= start || m <= end; // wrap-around support (e.g. Nov -> Feb)
+
+            return InRange(month, SeasonalLongStartMonth1, SeasonalLongEndMonth1)
+                || InRange(month, SeasonalLongStartMonth2, SeasonalLongEndMonth2);
+        }
+
+        private void PruneOldClosedTrades()
+        {
+            DateTime cutoff = Server.TimeInUtc.AddDays(-RecentTrendLookbackDays);
+            _recentClosedTrades.RemoveAll(t => t.ClosedAtUtc < cutoff);
+        }
+
+        private (double longPnl, double shortPnl) GetRecentPnL()
+        {
+            PruneOldClosedTrades();
+            double longPnl = _recentClosedTrades.Where(t => t.Direction == TradeType.Buy).Sum(t => t.NetProfit);
+            double shortPnl = _recentClosedTrades.Where(t => t.Direction == TradeType.Sell).Sum(t => t.NetProfit);
+            return (longPnl, shortPnl);
+        }
+
         private void CloseWithReason(string reason, double price, DateTime time)
         {
             if (_openPosition == null) return;
@@ -632,10 +746,20 @@ namespace cAlgo.Robots
             _stopTrailed = false;
         }
 
-        // Catches broker-triggered stop-loss fills (we didn't call ClosePosition ourselves for those).
+        // Fires for every close of our own positions - both broker-triggered (stop loss) and our own
+        // manual ClosePosition() calls (take profit, TP-flip, force-exit, week-rollover).
         private void OnPositionsClosed(PositionClosedEventArgs args)
         {
             if (args.Position.Label != PositionLabel || args.Position.SymbolName != SymbolName) return;
+
+            // Record P&L for the recent-trend detector regardless of why it closed.
+            _recentClosedTrades.Add(new ClosedTradeRecord
+            {
+                ClosedAtUtc = Server.TimeInUtc,
+                Direction = args.Position.TradeType,
+                NetProfit = args.Position.NetProfit
+            });
+
             if (args.Reason != PositionCloseReason.StopLoss) return; // manual closes are already logged at the call site
 
             string reason = _stopTrailed

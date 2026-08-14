@@ -91,15 +91,18 @@ if showDebugTable and barstate.islast
     f_debugRow(5, tf5Enable, tf5, s5, c5, compressionPct)
     f_debugRow(6, tf6Enable, tf6, s6, c6, compressionPct)
 
-// ---------------- Label drawing (only needs the latest bar) ----------------
-var array<label> activeLabels = array.new<label>()
+// ---------------- Label drawing (historical + live) ----------------
+// A label is placed every time the *set* of currently-compressed, enabled
+// timeframes changes to a new non-empty combination. This backfills one
+// marker per past compression episode as the script runs through history,
+// and keeps marking new ones as they occur. Pine auto-drops the oldest
+// labels once max_labels_count is exceeded, so very long histories simply
+// keep the most recent 500 episodes.
+currMask = (tf1Enable and c1 ? 1 : 0) + (tf2Enable and c2 ? 2 : 0) + (tf3Enable and c3 ? 4 : 0) +
+     (tf4Enable and c4 ? 8 : 0) + (tf5Enable and c5 ? 16 : 0) + (tf6Enable and c6 ? 32 : 0)
+var int prevMask = 0
 
-if barstate.islast
-    if array.size(activeLabels) > 0
-        for i = 0 to array.size(activeLabels) - 1
-            label.delete(array.get(activeLabels, i))
-        array.clear(activeLabels)
-
+if currMask != prevMask and currMask != 0
     levels = array.new_float()
     names  = array.new_string()
 
@@ -123,28 +126,29 @@ if barstate.islast
         array.push(names, f_tfLabel(tf6))
 
     n = array.size(levels)
-    if n > 0
-        used = array.new_bool(n, false)
-        for i = 0 to n - 1
-            if not array.get(used, i)
-                array.set(used, i, true)
-                lvlI = array.get(levels, i)
-                sumLvl = lvlI
-                cnt = 1
-                txt = array.get(names, i)
-                for j = i + 1 to n - 1
-                    if not array.get(used, j)
-                        lvlJ = array.get(levels, j)
-                        if math.abs(lvlJ - lvlI) / close * 100 <= groupPct
-                            array.set(used, j, true)
-                            sumLvl += lvlJ
-                            cnt += 1
-                            txt := txt + " + " + array.get(names, j)
-                avgLevel = sumLvl / cnt
-                lblColor = cnt > 1 ? labelColorMulti : labelColorBase
-                lblText = txt + " EMA " + str.tostring(ema1Len) + "/" + str.tostring(ema2Len) + "/" +
-                     str.tostring(ema3Len) + "/" + str.tostring(ema4Len) + " Compression\n" +
-                     str.tostring(avgLevel, format.mintick)
-                lbl = label.new(bar_index + labelOffset, avgLevel, lblText, xloc=xloc.bar_index,
-                     style=label.style_label_left, color=lblColor, textcolor=labelTextColor, size=labelSize)
-                array.push(activeLabels, lbl)
+    used = array.new_bool(n, false)
+    for i = 0 to n - 1
+        if not array.get(used, i)
+            array.set(used, i, true)
+            lvlI = array.get(levels, i)
+            sumLvl = lvlI
+            cnt = 1
+            txt = array.get(names, i)
+            for j = i + 1 to n - 1
+                if not array.get(used, j)
+                    lvlJ = array.get(levels, j)
+                    if math.abs(lvlJ - lvlI) / close * 100 <= groupPct
+                        array.set(used, j, true)
+                        sumLvl += lvlJ
+                        cnt += 1
+                        txt := txt + " + " + array.get(names, j)
+            avgLevel = sumLvl / cnt
+            lblColor = cnt > 1 ? labelColorMulti : labelColorBase
+            lblText = txt + " EMA " + str.tostring(ema1Len) + "/" + str.tostring(ema2Len) + "/" +
+                 str.tostring(ema3Len) + "/" + str.tostring(ema4Len) + " Compression\n" +
+                 str.tostring(avgLevel, format.mintick)
+            xPos = bar_index + (barstate.islast ? labelOffset : 0)
+            label.new(xPos, avgLevel, lblText, xloc=xloc.bar_index,
+                 style=label.style_label_left, color=lblColor, textcolor=labelTextColor, size=labelSize)
+
+prevMask := currMask

@@ -1,0 +1,589 @@
+//@version=5
+indicator("Weekly TP Reversal Window Indicator", overlay=true, max_lines_count=500, max_labels_count=50, max_boxes_count=250, max_bars_back=501)
+
+// Indicator version of the "Weekly TP Reversal Window Strategy" - same signals, same visuals, same
+// entry/exit reasoning labels, but it does NOT place real backtest orders (no equity curve, no Strategy
+// Tester report). It trades ONLY the reversal window (default Wed 14:30 -> Fri 16:00 UK, both configurable):
+//   - Background GREEN (bearish going into the window -> reversal UP expected) -> LONG
+//   - Background RED   (bullish going into the window -> reversal DOWN expected) -> SHORT
+// Entry:  inside the window, wait until price reverses ~0.83% (the trend threshold) from the weekly extreme,
+//         then fade it - i.e. enter at the shallow ~250-pt reversal, not a full 1.66%/500-pt TP.
+// Exit:   ride to the window-end day; the stop is always active; the TP-flip close is assessed from the
+//         window-end time; force-close at the window-end day's exit time (no weekend hold).
+// TP levels / the trend threshold can be sized in fixed Points or as a Percent of price (so they scale
+// across a long backtest - a 500-pt step at ~30k is ~1.66%, a 250-pt threshold ~0.83%).
+// Timeframe lock: the LEVELS are already chart-timeframe-independent (computed via request.security on
+// calcTf). Turn on "Lock execution to a fixed timeframe" to also pin the ENTRY/EXIT/WINDOW decisions to a
+// fixed timeframe, so changing the CHART timeframe no longer changes the results.
+// Simulated position: since an indicator can't hold a real broker position or a resting stop order, this
+// script tracks its own position state (direction + entry price) and checks the stop against the locked-
+// timeframe bar's high/low each bar. This is a close approximation of the strategy's stop fills, not an
+// exact replica of broker order execution.
+
+tpStep         = input.float(500, "TP Increment (points)", minval=1)
+tpLevels       = input.int(9, "Number of TP Levels", minval=1, maxval=10)
+trendThreshold = input.float(250, "Trend / Reversal Threshold (points)", minval=1)
+tpUnit         = input.string("Percent", "TP / Threshold units", ["Points", "Percent"], tooltip="Points = fixed increments. Percent = increments scale with price (a % of the week's open), so levels stay proportional across a long backtest - e.g. a 500-pt step at ~30k ~ 1.66%.")
+tpStepPct      = input.float(1.66, "TP Increment (% of price)", minval=0.01)
+trendThreshPct = input.float(0.83, "Trend / Reversal Threshold (% of price)", minval=0.01)
+showWeekLines  = input.bool(true, "Show Weekly High/Low/Open Lines")
+calcTf         = input.timeframe("5", "Calculation Timeframe")
+
+showVP    = input.bool(true, "Show Anchored Volume Profile", group="Volume Profile")
+vpRows    = input.int(75, "Row Size", minval=5, maxval=100, group="Volume Profile")
+vpWidth   = input.int(60, "Max Width (bars)", minval=10, maxval=200, group="Volume Profile")
+vpBin     = input.float(2, "Accumulation Bin Size (points)", minval=0.25, group="Volume Profile")
+vaPercent = input.float(70., "Value Area Volume %", minval=0, maxval=100, group="Volume Profile")
+pocColorI = input.color(color.white, "POC Color", group="Volume Profile")
+pocWidth  = input.int(2, "POC Width", minval=1, maxval=5, group="Volume Profile")
+vaUpCol   = input.color(#26c6da, "Value Area Up", group="Volume Profile")
+vaDnCol   = input.color(#ec407a, "Value Area Down", group="Volume Profile")
+upCol     = input.color(color.new(#26c6da, 75), "Up Volume", group="Volume Profile")
+dnCol     = input.color(color.new(#ec407a, 75), "Down Volume", group="Volume Profile")
+showPoc   = input.bool(false, "Show POC Label", group="Volume Profile")
+vpOffset  = input.int(0, "Right-side gap (bars past profile)", minval=0, maxval=300, group="Volume Profile", tooltip="The profile is auto-placed just to the right of price - its own Max Width is accounted for automatically, so it never overlaps the candles. This adds N extra bars of clearance beyond that. Total right-shift is capped at 500 (Pine's future-draw limit).")
+
+showWarning  = input.bool(true, "Show Reversal Warning", group="Reversal Warning")
+cutoffTz     = input.string("Europe/London", "Warning Timezone", group="Reversal Warning")
+cutoffDay    = input.string("Wednesday", "Warning Start Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Reversal Warning")
+cutoffHour   = input.int(13, "Warning Start Hour", minval=0, maxval=23, group="Reversal Warning")
+cutoffMinute = input.int(15, "Warning Start Minute", minval=0, maxval=59, group="Reversal Warning")
+warnEndDay   = input.string("Friday", "Warning End Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Reversal Warning")
+warnEndHour  = input.int(9, "Warning End Hour", minval=0, maxval=23, group="Reversal Warning")
+warnEndMin   = input.int(45, "Warning End Minute", minval=0, maxval=59, group="Reversal Warning")
+
+// ---- Strategy controls ----
+enableLongs    = input.bool(true,  "Trade Longs (green background)",  group="Strategy")
+enableShorts   = input.bool(true,  "Trade Shorts (red background)",   group="Strategy")
+useTPEntry     = input.bool(true,  "Enter only at a reversal/TP sweep", group="Strategy", tooltip="Inside the reversal window, wait until price trades within the proximity % of a level (in the trend direction) before fading it. Off = enter at the window start.")
+entryAtReversal = input.bool(false, "Also enter at the 0.83% reversal (shallow ~250-pt)", group="Strategy", tooltip="On = the shallow ~250-pt (0.83%) reversal can trigger the entry, so trades fill earlier/closer to the extreme. Off = wait for a full TP level (~500 pts / 1.66% and deeper). In backtest the deeper TP entry (OFF) produced higher reward (193% vs 166%).")
+tpProxPct      = input.float(0.088,  "Entry proximity %", minval=0.01, group="Strategy", tooltip="How close (as a % of price) the bar must come to the reversal / TP level to trigger the entry.")
+openTolPct     = input.float(0.0,  "Weekly-open tolerance %", minval=0, group="Strategy", tooltip="How far past the weekly open an entry is still allowed. A LONG may enter below the open or up to this % above it; a SHORT above the open or up to this % below it. 0 = strict (long only below open, short only above) - the higher-reward setting.")
+useStop        = input.bool(true,  "Use Stop Loss",                   group="Strategy")
+stopUnit       = input.string("Points", "Stop loss units", ["Points", "Percent"], group="Strategy", tooltip="Points = a fixed point distance. Percent = a % of the entry (avg) price, so the stop scales with price across a long backtest (275 pts at ~30k ~ 0.9%).")
+stopPts        = input.float(275,  "Stop Loss (points)", minval=1,    group="Strategy")
+stopPct        = input.float(0.89,  "Stop Loss (% of entry)", minval=0.01, group="Strategy")
+useTrailStop   = input.bool(false, "Trail Stop to Breakeven + Step Increments", group="Strategy", tooltip="Once the Stop Trail Day/Time is reached (in the Warning Timezone), the stop loss moves to breakeven (entry price), then steps up in Trail Step increments as price reaches them, in the trade's favor. The stop only ever tightens, never loosens.")
+trailStepUnit  = input.string("Points", "Trail Step Units", ["Points", "Percent"], group="Strategy", tooltip="Points = a fixed point increment. Percent = a % of the relevant weekly extreme, so the trail step scales with price. Independent from the main TP Increment settings, so you can tune it separately.")
+trailStepPts   = input.float(500,  "Trail Step (points)", minval=1,    group="Strategy")
+trailStepPct   = input.float(1.66, "Trail Step (% of price)", minval=0.01, group="Strategy")
+trailDay       = input.string("Thursday", "Stop Trail Day", options=["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"], group="Strategy")
+trailHour      = input.int(12,     "Stop Trail Hour",   minval=0, maxval=23, group="Strategy")
+trailMin       = input.int(0,      "Stop Trail Minute", minval=0, maxval=59, group="Strategy")
+showTrailPlot  = input.bool(true, "Show Trailing Stop on Chart", group="Strategy", tooltip="Plots the live stop level (solid, steps up with the trail) and the trail's target level (dotted, where it's climbing toward) while a trade is open.")
+showReasons    = input.bool(true, "Show Entry/Exit Reasoning Labels", group="Strategy", tooltip="Labels each simulated entry and exit on the chart with why it fired (which level triggered it, or which exit rule closed it).")
+exitHour       = input.int(21,     "Force-exit hour (window-end day)",   minval=0, maxval=23, group="Strategy", tooltip="Latest exit on the Warning End Day, in the Warning Timezone. Any trade still open is closed at this time - no weekend hold. The TP can still exit earlier.")
+exitMin        = input.int(45,      "Force-exit minute (window-end day)", minval=0, maxval=59, group="Strategy")
+lockExecTf     = input.bool(true, "Lock execution to a fixed timeframe", group="Strategy", tooltip="On = read the entry, exit and reversal-window on a FIXED timeframe (below) via request.security, so changing the CHART timeframe no longer changes the results. Keep the chart at that timeframe or LOWER. Off (default) = use the chart's own bars - the behaviour that produced the tuned result.")
+execLockTf     = input.timeframe("15", "Locked execution timeframe", group="Strategy", tooltip="The timeframe the strategy is pinned to when the lock above is on. Set it to the timeframe you tuned/backtested on (15m).")
+
+formatPrice(x) =>
+    r = math.round(x)
+    s = str.tostring(r)
+    neg = str.startswith(s, "-")
+    digits = neg ? str.substring(s, 1) : s
+    l = str.length(digits)
+    out = ""
+    for idx = 0 to l - 1
+        out += str.substring(digits, idx, idx + 1)
+        remaining = l - idx - 1
+        if remaining > 0 and remaining % 3 == 0
+            out += ","
+    neg ? "-" + out : out
+
+// Maps a day-of-week dropdown selection to Pine's dayofweek.* constant (Sunday=1 ... Saturday=7).
+dayNameToInt(name) =>
+    name == "Sunday" ? dayofweek.sunday :
+     name == "Monday" ? dayofweek.monday :
+     name == "Tuesday" ? dayofweek.tuesday :
+     name == "Wednesday" ? dayofweek.wednesday :
+     name == "Thursday" ? dayofweek.thursday :
+     name == "Friday" ? dayofweek.friday :
+     dayofweek.saturday
+
+// volume contained where a price segment [y21,y22] intersects a row [y11,y12]
+get_vol(y11, y12, y21, y22, height, vol) =>
+    nz(math.max(math.min(math.max(y11, y12), math.max(y21, y22)) - math.max(math.min(y11, y12), math.min(y21, y22)), 0) * vol / height)
+
+calc() =>
+    var float wHigh    = na
+    var float wLow     = na
+    var float weekOpen = na
+    var string mode       = na
+    var int confirmedUp   = 0
+    var int confirmedDown = 0
+    var float lastResistance = na
+    var float lastSupport    = na
+    var float legHigh = na
+    var float legLow  = na
+    var int wHighTime = na
+    var int wLowTime  = na
+    var int weekStartTime = na
+
+    newWeek = ta.change(time("W")) != 0
+
+    if newWeek or na(wHigh)
+        wHigh := high
+        wLow  := low
+        weekOpen := open
+        wHighTime := time
+        wLowTime := time
+        weekStartTime := time
+        mode := na
+        confirmedUp := 0
+        confirmedDown := 0
+        lastResistance := na
+        lastSupport := na
+        legHigh := na
+        legLow := na
+    else
+        if high > wHigh
+            wHigh := high
+            wHighTime := time
+        if low < wLow
+            wLow := low
+            wLowTime := time
+
+    // Effective TP increment / trend threshold. In Percent mode these are EXACT %s of the relevant weekly
+    // extreme, so down-TPs sit at 1.66%/3.32%/4.98%... below the HIGH and up-TPs the same above the LOW,
+    // and the 0.83% direction threshold is measured off the same extreme. Fixed points otherwise.
+    float tpStepUp = tpUnit == "Percent" and not na(wLow)  ? wLow  * tpStepPct / 100      : tpStep
+    float tpStepDn = tpUnit == "Percent" and not na(wHigh) ? wHigh * tpStepPct / 100      : tpStep
+    float threshUp = tpUnit == "Percent" and not na(wLow)  ? wLow  * trendThreshPct / 100 : trendThreshold
+    float threshDn = tpUnit == "Percent" and not na(wHigh) ? wHigh * trendThreshPct / 100 : trendThreshold
+
+    // TP hit tracking: legHigh/legLow mirror wHigh/wLow but reset fresh on each flip.
+    float prevLegHigh = legHigh
+    float prevLegLow  = legLow
+    legHigh := na(legHigh) ? high : math.max(legHigh, high)
+    legLow  := na(legLow) ? low : math.min(legLow, low)
+    madeNewLegHigh = na(prevLegHigh) or legHigh != prevLegHigh
+    madeNewLegLow  = na(prevLegLow) or legLow != prevLegLow
+
+    newConfirmedUp   = confirmedUp
+    newConfirmedDown = confirmedDown
+    if madeNewLegHigh
+        for i = 1 to tpLevels
+            if legHigh >= wLow + tpStepUp * i
+                newConfirmedUp := i
+    if madeNewLegLow
+        for i = 1 to tpLevels
+            if legLow <= wHigh - tpStepDn * i
+                newConfirmedDown := i
+    confirmedUp := newConfirmedUp
+    confirmedDown := newConfirmedDown
+
+    // Trend / reversal, both sides, always.
+    bearSignal = not na(wHigh) and not na(wLow) and close <= wHigh - threshDn
+    bullSignal = not na(wHigh) and not na(wLow) and close >= wLow + threshUp
+
+    prevMode = mode
+    if bullSignal and not bearSignal
+        mode := "up"
+    else if bearSignal and not bullSignal
+        mode := "down"
+
+    if mode != prevMode
+        if prevMode == "up" and confirmedUp > 0
+            lastResistance := wLow + tpStepUp * confirmedUp
+        if prevMode == "down" and confirmedDown > 0
+            lastSupport := wHigh - tpStepDn * confirmedDown
+        if mode == "up" and prevMode == "down"
+            legHigh := na
+        if mode == "down" and prevMode == "up"
+            legLow := na
+
+    // ---- Volume profile (accumulated into fixed absolute price bins, reset weekly).
+    var map<int, float> vpUp = map.new<int, float>()
+    var map<int, float> vpDn = map.new<int, float>()
+    if newWeek
+        map.clear(vpUp)
+        map.clear(vpDn)
+    if showVP and not na(volume) and volume > 0
+        bTop = math.max(close, open)
+        bBot = math.min(close, open)
+        green = close >= open
+        tw = high - bTop
+        bw = bBot - low
+        bd = bTop - bBot
+        den = 2 * tw + 2 * bw + bd
+        if den > 0
+            bv  = bd * volume / den
+            twv = 2 * tw * volume / den
+            bwv = 2 * bw * volume / den
+            loBin = int(math.floor(low / vpBin))
+            hiBin = int(math.floor(high / vpBin))
+            for bi = loBin to hiBin
+                binLo = bi * vpBin
+                binHi = binLo + vpBin
+                wa = get_vol(binLo, binHi, bTop, high, tw, twv) / 2 + get_vol(binLo, binHi, bBot, low, bw, bwv) / 2
+                ua = (green ? get_vol(binLo, binHi, bBot, bTop, bd, bv) : 0) + wa
+                da = (green ? 0 : get_vol(binLo, binHi, bBot, bTop, bd, bv)) + wa
+                cu = map.contains(vpUp, bi) ? map.get(vpUp, bi) : 0.0
+                map.put(vpUp, bi, cu + ua)
+                cd = map.contains(vpDn, bi) ? map.get(vpDn, bi) : 0.0
+                map.put(vpDn, bi, cd + da)
+
+    var float[] vpLevels  = array.new_float(0)
+    var float[] vpVolumes = array.new_float(0)
+    float vpTop = na
+    float vpBot = na
+    if showVP and barstate.islast and not na(wHigh) and not na(wLow) and wHigh > wLow
+        vpTop := wHigh
+        vpBot := wLow
+        cn = vpRows
+        binSize = (wHigh - wLow) / cn
+        array.clear(vpLevels)
+        for x = 0 to cn
+            array.push(vpLevels, wLow + binSize * x)
+        array.clear(vpVolumes)
+        for x = 0 to cn * 2 - 1
+            array.push(vpVolumes, 0.0)
+        for [bi, uv] in vpUp
+            price = (bi + 0.5) * vpBin
+            if price >= wLow and price < wHigh
+                row = int((price - wLow) / binSize)
+                row := math.min(math.max(row, 0), cn - 1)
+                array.set(vpVolumes, row, array.get(vpVolumes, row) + uv)
+        for [bi, dv] in vpDn
+            price = (bi + 0.5) * vpBin
+            if price >= wLow and price < wHigh
+                row = int((price - wLow) / binSize)
+                row := math.min(math.max(row, 0), cn - 1)
+                array.set(vpVolumes, row + cn, array.get(vpVolumes, row + cn) + dv)
+
+    [wHigh, wLow, weekOpen, mode, confirmedUp, confirmedDown, lastResistance, lastSupport, legHigh, legLow, wHighTime, wLowTime, weekStartTime, vpLevels, vpVolumes, vpTop, vpBot]
+
+[wHigh, wLow, weekOpen, mode, confirmedUp, confirmedDown, lastResistance, lastSupport, legHigh, legLow, wHighTime, wLowTime, weekStartTime, vpLevels, vpVolumes, vpTop, vpBot] = request.security(syminfo.tickerid, calcTf, calc())
+
+modeChanged = mode != mode[1]
+confirmedCount = mode == "up" ? confirmedUp : mode == "down" ? confirmedDown : 0
+
+// ---- Optional execution-timeframe lock. When ON, the entry / exit / window read a FIXED timeframe via
+// request.security (non-repainting, lookahead off), so changing the CHART timeframe no longer changes the
+// results - keep the chart at execLockTf or lower. When OFF, x* fall through to the chart's own series, so
+// behaviour is exactly the chart-timeframe default. xNewBar gates order logic to one evaluation per locked
+// bar (always true when the lock is off). ----
+[sHigh, sLow, sClose, sTime] = request.security(syminfo.tickerid, execLockTf, [high, low, close, time], lookahead=barmerge.lookahead_off)
+float xHigh   = lockExecTf ? sHigh  : high
+float xLow    = lockExecTf ? sLow   : low
+float xClose  = lockExecTf ? sClose : close
+int   xTime   = lockExecTf ? sTime  : time
+bool  xNewBar = lockExecTf ? (ta.change(sTime) != 0) : true
+
+// Effective TP increment / reversal threshold in the chart scope (same anchor-based rule as inside calc),
+// for drawing, entry, exit.
+float tpStepUpMain = tpUnit == "Percent" and not na(wLow)  ? wLow  * tpStepPct / 100 : tpStep
+float tpStepDnMain = tpUnit == "Percent" and not na(wHigh) ? wHigh * tpStepPct / 100 : tpStep
+float threshUpMain = tpUnit == "Percent" and not na(wLow)  ? wLow  * trendThreshPct / 100 : trendThreshold
+float threshDnMain = tpUnit == "Percent" and not na(wHigh) ? wHigh * trendThreshPct / 100 : trendThreshold
+
+// ---- Draw the volume profile. Right-anchored at (current bar + width + gap), extending left. ----
+var box[] vpBoxes = array.new_box()
+var line pocLine = na
+var label pocLabel = na
+
+vpSize = na(vpVolumes) ? 0 : array.size(vpVolumes)
+if showVP and barstate.islast and vpSize == vpRows * 2 and not na(vpTop) and not na(vpBot) and vpTop > vpBot
+    cnum = vpRows
+    dist = (vpTop - vpBot) / 500
+    totalvols = array.new_float(cnum, 0.)
+    for x = 0 to cnum - 1
+        array.set(totalvols, x, array.get(vpVolumes, x) + array.get(vpVolumes, x + cnum))
+
+    int poc = array.indexof(totalvols, array.max(totalvols))
+
+    totalmax = array.sum(totalvols) * vaPercent / 100.
+    va_total = array.get(totalvols, poc)
+    int up = poc
+    int down = poc
+    for x = 0 to cnum - 1
+        if va_total >= totalmax
+            break
+        uppervol = up < cnum - 1 ? array.get(totalvols, up + 1) : 0.
+        lowervol = down > 0 ? array.get(totalvols, down - 1) : 0.
+        if uppervol == 0 and lowervol == 0
+            break
+        if uppervol >= lowervol
+            va_total += uppervol
+            up += 1
+        else
+            va_total += lowervol
+            down -= 1
+
+    maxvol = array.max(totalvols)
+    scaled = array.new_float(cnum * 2, 0.)
+    if maxvol > 0
+        for x = 0 to cnum * 2 - 1
+            array.set(scaled, x, array.get(vpVolumes, x) * vpWidth / maxvol)
+
+    while array.size(vpBoxes) > 0
+        box.delete(array.pop(vpBoxes))
+    rightX = bar_index + math.min(500, vpWidth + vpOffset)
+    for x = 0 to cnum - 1
+        upW = math.round(array.get(scaled, x))
+        dnW = math.round(array.get(scaled, x + cnum))
+        lv0 = array.get(vpLevels, x)
+        lv1 = array.get(vpLevels, x + 1)
+        inVA = x >= down and x <= up
+        b1 = box.new(rightX - upW, lv1 - dist, rightX, lv0 + dist, border_width=0, bgcolor=inVA ? vaUpCol : upCol)
+        b2 = box.new(rightX - upW - dnW, lv1 - dist, rightX - upW, lv0 + dist, border_width=0, bgcolor=inVA ? vaDnCol : dnCol)
+        array.push(vpBoxes, b1)
+        array.push(vpBoxes, b2)
+
+    poc_level = (array.get(vpLevels, poc) + array.get(vpLevels, poc + 1)) / 2
+    line.delete(pocLine)
+    pocLine := line.new(rightX - 1, poc_level, rightX, poc_level, extend=extend.left, color=pocColorI, width=pocWidth)
+    label.delete(pocLabel)
+    if showPoc
+        pocLabel := label.new(rightX + 15, poc_level, text="POC: " + str.tostring(math.round_to_mintick(poc_level)), style=close >= poc_level ? label.style_label_up : label.style_label_down)
+
+// ---- Weekly high / low / open lines, one persistent set PER WEEK ----
+var line whLine = na
+var line wlLine = na
+var line woLine = na
+newWeekChart = ta.change(time("W")) != 0
+if showWeekLines and not na(wHigh)
+    if na(whLine) or newWeekChart
+        whLine := line.new(bar_index, wHigh, bar_index, wHigh, color=color.green, width=2)
+        wlLine := line.new(bar_index, wLow, bar_index, wLow, color=color.red, width=2)
+        woLine := line.new(bar_index, weekOpen, bar_index, weekOpen, color=color.yellow, width=2)
+    else
+        line.set_y1(whLine, wHigh)
+        line.set_xy2(whLine, bar_index, wHigh)
+        line.set_y1(wlLine, wLow)
+        line.set_xy2(wlLine, bar_index, wLow)
+        line.set_y1(woLine, weekOpen)
+        line.set_xy2(woLine, bar_index, weekOpen)
+
+var line[] tpLines = array.new_line()
+var label[] tpLabels = array.new_label()
+
+if barstate.islast
+    while array.size(tpLines) > 0
+        line.delete(array.pop(tpLines))
+    while array.size(tpLabels) > 0
+        label.delete(array.pop(tpLabels))
+
+    resActive = not na(lastResistance) and close < lastResistance
+    supActive = not na(lastSupport) and close > lastSupport
+
+    if not na(mode)
+        lineColor = mode == "up" ? color.lime : color.orange
+        stepUsed = mode == "up" ? tpStepUpMain : tpStepDnMain
+        for i = 1 to tpLevels
+            lvl = mode == "up" ? wLow + stepUsed * i : wHigh - stepUsed * i
+            onResistance = resActive and math.round(lvl) == math.round(lastResistance)
+            onSupport    = supActive and math.round(lvl) == math.round(lastSupport)
+            if not onResistance and not onSupport
+                hit = i <= confirmedCount
+                ln = line.new(bar_index, lvl, bar_index + 30, lvl, color=lineColor, style=line.style_dashed, width=hit ? 2 : 1)
+                labelText = "TP" + str.tostring(i) + (hit ? " * " : "  ") + formatPrice(lvl) + " (" + str.tostring(int(stepUsed * i)) + " points)"
+                lb = label.new(bar_index + 30, lvl, labelText, style=label.style_label_left, color=color.new(lineColor, hit ? 15 : 55), textcolor=color.white, size=size.small)
+                array.push(tpLines, ln)
+                array.push(tpLabels, lb)
+
+    if not na(lastResistance) and close < lastResistance
+        rln = line.new(bar_index, lastResistance, bar_index + 30, lastResistance, color=color.fuchsia, style=line.style_dotted, width=1)
+        rlb = label.new(bar_index + 30, lastResistance, "Resistance " + formatPrice(lastResistance), style=label.style_label_left, color=color.new(color.fuchsia, 55), textcolor=color.white, size=size.small)
+        array.push(tpLines, rln)
+        array.push(tpLabels, rlb)
+
+    if not na(lastSupport) and close > lastSupport
+        sln = line.new(bar_index, lastSupport, bar_index + 30, lastSupport, color=color.aqua, style=line.style_dotted, width=1)
+        slb = label.new(bar_index + 30, lastSupport, "Support " + formatPrice(lastSupport), style=label.style_label_left, color=color.new(color.aqua, 55), textcolor=color.white, size=size.small)
+        array.push(tpLines, sln)
+        array.push(tpLabels, slb)
+
+// ---- Reversal warning window (Warning Start Day/time -> Warning End Day/time, in cutoffTz) ----
+// Uses xTime, so the window aligns to the locked timeframe when the lock is on (chart time otherwise).
+// Start/end days are configurable dropdowns; the window logic below handles both the normal case
+// (start day earlier in the week than end day, e.g. Wed -> Fri) and a window that wraps across the
+// week boundary (e.g. Fri -> Mon).
+cutoffDayInt  = dayNameToInt(cutoffDay)
+warnEndDayInt = dayNameToInt(warnEndDay)
+
+wDow  = dayofweek(xTime, cutoffTz)
+wHour = hour(xTime, cutoffTz)
+wMin  = minute(xTime, cutoffTz)
+afterStart = wDow > cutoffDayInt or (wDow == cutoffDayInt and (wHour > cutoffHour or (wHour == cutoffHour and wMin >= cutoffMinute)))
+beforeEnd  = wDow < warnEndDayInt or (wDow == warnEndDayInt and (wHour < warnEndHour or (wHour == warnEndHour and wMin < warnEndMin)))
+// Normal window (start day on/before end day, e.g. Wed -> Fri): both conditions must hold.
+// Wrapping window (start day after end day, e.g. Fri -> Mon): either condition holds.
+inWarnWindow = cutoffDayInt <= warnEndDayInt ? (afterStart and beforeEnd) : (afterStart or beforeEnd)
+
+// Colour locked to the trend entering the window: bearish -> green (reversal up), bullish -> red (reversal down).
+var string warnTrend = na
+if ta.change(time("W")) != 0
+    warnTrend := na
+if inWarnWindow and not inWarnWindow[1]
+    warnTrend := mode
+bgTint = warnTrend == "down" ? color.new(color.green, 88) : warnTrend == "up" ? color.new(color.red, 88) : na
+bgcolor(showWarning and inWarnWindow ? bgTint : na, title="Reversal Window")
+
+// ---- Simulated position: trade ONLY inside the reversal window ----
+// Direction "down" (green, reversal UP)   -> LONG ; "up" (red, reversal DOWN) -> SHORT.
+windowStart = inWarnWindow and not inWarnWindow[1]
+windowEnd   = not inWarnWindow and inWarnWindow[1]
+
+var bool tradedWindow = false
+var string posDir      = na   // simulated position: "long", "short", or na (flat) - no real order is placed
+var float  posAvgPrice = na   // simulated entry price
+if windowStart
+    tradedWindow := false
+string dir = not na(warnTrend) ? warnTrend : mode   // captured trend, else live trend
+
+// Reversal entry gate: fire once price trades within tpProxPct % of the 0.83% reversal level (the trend
+// threshold, ~250 pts from the extreme) OR any deeper TP level, in the trend direction (fade the move).
+// Because only the first touch per window trades, the entry lands at the SHALLOW ~250-pt reversal, not a
+// full 1.66%/500-pt TP. Off -> enter at the first in-window bar that has a direction. Uses xHigh/xLow so
+// the touch test respects the locked timeframe when the lock is on.
+bool nearTP = false
+string nearReason = na
+if dir == "down"
+    if entryAtReversal
+        float rlvl = wHigh - threshDnMain
+        if not na(rlvl) and rlvl > 0 and math.abs(xLow - rlvl) <= rlvl * tpProxPct / 100
+            nearTP := true
+            nearReason := "0.83% reversal (" + str.tostring(int(threshDnMain)) + "pt) off weekly high"
+    for i = 1 to tpLevels
+        float lvl = wHigh - tpStepDnMain * i
+        if not na(lvl) and lvl > 0 and math.abs(xLow - lvl) <= lvl * tpProxPct / 100
+            nearTP := true
+            nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepDnMain * i)) + "pt) off weekly high"
+else if dir == "up"
+    if entryAtReversal
+        float rlvl = wLow + threshUpMain
+        if not na(rlvl) and rlvl > 0 and math.abs(xHigh - rlvl) <= rlvl * tpProxPct / 100
+            nearTP := true
+            nearReason := "0.83% reversal (" + str.tostring(int(threshUpMain)) + "pt) off weekly low"
+    for i = 1 to tpLevels
+        float lvl = wLow + tpStepUpMain * i
+        if not na(lvl) and lvl > 0 and math.abs(xHigh - lvl) <= lvl * tpProxPct / 100
+            nearTP := true
+            nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepUpMain * i)) + "pt) off weekly low"
+bool entryTrigger = useTPEntry ? nearTP : true
+
+// Weekly-open filter with an openTolPct % tolerance band: a LONG (fades a dip) is allowed BELOW the weekly
+// open or up to openTolPct % ABOVE it; a SHORT (fades a pop) ABOVE the open or up to openTolPct % BELOW it.
+// Beyond that band -> no entry. Set openTolPct = 0 for the strict long-below / short-above behaviour.
+bool openOkLong  = not na(weekOpen) and xClose < weekOpen * (1 + openTolPct / 100)
+bool openOkShort = not na(weekOpen) and xClose > weekOpen * (1 - openTolPct / 100)
+
+if inWarnWindow and not tradedWindow and na(posDir) and not na(dir) and entryTrigger and xNewBar
+    if dir == "down" and enableLongs and openOkLong
+        longReason = "LONG - bearish into window, reversal UP: " + (useTPEntry ? nearReason : "window start (no TP-sweep filter)")
+        posDir := "long"
+        posAvgPrice := xClose
+        if showReasons
+            label.new(bar_index, xLow, longReason, style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+        tradedWindow := true
+    else if dir == "up" and enableShorts and openOkShort
+        shortReason = "SHORT - bullish into window, reversal DOWN: " + (useTPEntry ? nearReason : "window start (no TP-sweep filter)")
+        posDir := "short"
+        posAvgPrice := xClose
+        if showReasons
+            label.new(bar_index, xHigh, shortReason, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+        tradedWindow := true
+
+// ---- Exit ----
+// Protective stop is ALWAYS active (checked every bar against the locked-timeframe high/low - an indicator
+// can't place a real resting broker order). The TP-flip close is gated by timeframe priority: no flip-based
+// exit before the window-end day's window-end time (default 16:00); from then, assess by STATE - SHORT
+// exits once trend is UP (a down-TP became support), LONG exits once trend is DOWN (an up-TP became
+// resistance). If neither, force-close at the window-end day's exit time (default 21:00).
+afterWindowEnd = wDow == warnEndDayInt and (wHour > warnEndHour or (wHour == warnEndHour and wMin >= warnEndMin))
+forceExit      = wDow == warnEndDayInt and (wHour > exitHour or (wHour == exitHour and wMin >= exitMin))
+
+// Trailing stop: once the Stop Trail Day/Time is reached, move the stop to breakeven, then step it up
+// through Trail Step increments (own Points/Percent unit + amount, default 500/1.66% - independent of the
+// main TP Increment settings) as price reaches them in the trade's favor. "Smart" confirmation mirrors the
+// Trend / Reversal Threshold logic (bearSignal/bullSignal above): it requires the CLOSE, not just a wick,
+// to have travelled that many steps past the weekly extreme, so a brief spike can't trail the stop and get
+// it stopped straight back out. It only ever tightens, never loosens.
+trailDayInt    = dayNameToInt(trailDay)
+pastTrailTime  = wDow > trailDayInt or (wDow == trailDayInt and (wHour > trailHour or (wHour == trailHour and wMin >= trailMin)))
+
+float trailStepUp = trailStepUnit == "Percent" and not na(wLow)  ? wLow  * trailStepPct / 100 : trailStepPts
+float trailStepDn = trailStepUnit == "Percent" and not na(wHigh) ? wHigh * trailStepPct / 100 : trailStepPts
+int trailStepsUp   = trailStepUp > 0 and not na(wLow)  ? int(math.floor(math.max(xClose - wLow, 0) / trailStepUp)) : 0
+int trailStepsDown = trailStepDn > 0 and not na(wHigh) ? int(math.floor(math.max(wHigh - xClose, 0) / trailStepDn)) : 0
+
+float trailLevelLong  = posAvgPrice
+float trailLevelShort = posAvgPrice
+if trailStepsUp > 0
+    trailLevelLong := math.max(trailLevelLong, wLow + trailStepUp * trailStepsUp)
+if trailStepsDown > 0
+    trailLevelShort := math.min(trailLevelShort, wHigh - trailStepDn * trailStepsDown)
+
+// Stop loss - simulated: computed every bar and checked below against the locked-timeframe bar's high/low.
+// Distance is a fixed point amount, or a % of the entry (avg) price when Percent units are selected.
+float stopDist = stopUnit == "Percent" ? posAvgPrice * stopPct / 100 : stopPts
+float longStopLevel  = posAvgPrice - stopDist
+float shortStopLevel = posAvgPrice + stopDist
+bool  longStopTrailed  = false
+bool  shortStopTrailed = false
+if useTrailStop and pastTrailTime
+    if trailLevelLong > longStopLevel
+        longStopLevel := trailLevelLong
+        longStopTrailed := true
+    if trailLevelShort < shortStopLevel
+        shortStopLevel := trailLevelShort
+        shortStopTrailed := true
+longStopReason  = longStopTrailed  ? "Trailing stop hit @ " + formatPrice(longStopLevel)  + " (locked-in profit)" : "Stop loss hit @ " + formatPrice(longStopLevel)
+shortStopReason = shortStopTrailed ? "Trailing stop hit @ " + formatPrice(shortStopLevel) + " (locked-in profit)" : "Stop loss hit @ " + formatPrice(shortStopLevel)
+
+// ---- Visualize the trailing stop on the chart ----
+// Solid line = the simulated active stop (steps up/down as each Trail Step level is confirmed by a close).
+// Dotted line = the trail's current target level, visible even before the Stop Trail Day/Time arrives,
+// so you can see where it will jump to once trailing activates.
+plot(showTrailPlot and posDir == "long"  ? longStopLevel  : na, title="Long Stop (incl. Trail)",  color=color.red, style=plot.style_linebr, linewidth=2)
+plot(showTrailPlot and posDir == "short" ? shortStopLevel : na, title="Short Stop (incl. Trail)", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(showTrailPlot and useTrailStop and posDir == "long"  ? trailLevelLong  : na, title="Long Trail Target",  color=color.new(color.yellow, 40), style=plot.style_circles, linewidth=1)
+plot(showTrailPlot and useTrailStop and posDir == "short" ? trailLevelShort : na, title="Short Trail Target", color=color.new(color.yellow, 40), style=plot.style_circles, linewidth=1)
+
+// Stop-loss fill check: the locked-timeframe bar's high/low crossing the stop level. Checked first, so it
+// takes priority over the TP-flip/force-exit checks below within the same bar (matches the strategy's
+// "protective stop is always active" priority).
+if useStop and posDir == "long" and not na(longStopLevel) and xLow <= longStopLevel
+    if showReasons
+        label.new(bar_index, longStopLevel, longStopReason, style=label.style_label_up, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+    posDir := na
+    posAvgPrice := na
+if useStop and posDir == "short" and not na(shortStopLevel) and xHigh >= shortStopLevel
+    if showReasons
+        label.new(bar_index, shortStopLevel, shortStopReason, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+    posDir := na
+    posAvgPrice := na
+
+// TP-flip exit - only from the window-end day's window-end time onward, assessed once per locked bar.
+if afterWindowEnd and xNewBar
+    if posDir == "long" and mode == "down"
+        flipReason = "LONG exit - trend flipped DOWN (up-TP became resistance)"
+        if showReasons
+            label.new(bar_index, xClose, flipReason, style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
+        posDir := na
+        posAvgPrice := na
+    if posDir == "short" and mode == "up"
+        flipReason = "SHORT exit - trend flipped UP (down-TP became support)"
+        if showReasons
+            label.new(bar_index, xClose, flipReason, style=label.style_label_up, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
+        posDir := na
+        posAvgPrice := na
+
+// Latest exit: force close on the window-end day at the exit time (no weekend hold). Week-rollover is a
+// safety net only.
+if forceExit and xNewBar
+    if not na(posDir)
+        timeReason = "Force exit - window-end time reached, no weekend hold"
+        if showReasons
+            label.new(bar_index, xClose, timeReason, style=label.style_label_left, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+        posDir := na
+        posAvgPrice := na
+else if ta.change(time("W")) != 0
+    if not na(posDir)
+        safetyReason = "Week rollover - safety close"
+        if showReasons
+            label.new(bar_index, xClose, safetyReason, style=label.style_label_left, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+        posDir := na
+        posAvgPrice := na

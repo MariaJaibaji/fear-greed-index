@@ -445,23 +445,27 @@ if dir == "down"
         float rlvl = wHigh - threshDnMain
         if not na(rlvl) and rlvl > 0 and math.abs(xLow - rlvl) <= rlvl * tpProxPct / 100
             nearTP := true
-            nearReason := "0.83% reversal (" + str.tostring(int(threshDnMain)) + "pt) off weekly high"
+            if na(nearReason)
+                nearReason := "0.83% reversal (" + str.tostring(int(threshDnMain)) + "pt) off weekly high, touched " + formatPrice(rlvl)
     for i = 1 to tpLevels
         float lvl = wHigh - tpStepDnMain * i
         if not na(lvl) and lvl > 0 and math.abs(xLow - lvl) <= lvl * tpProxPct / 100
             nearTP := true
-            nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepDnMain * i)) + "pt) off weekly high"
+            if na(nearReason)
+                nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepDnMain * i)) + "pt) off weekly high, touched " + formatPrice(lvl)
 else if dir == "up"
     if entryAtReversal
         float rlvl = wLow + threshUpMain
         if not na(rlvl) and rlvl > 0 and math.abs(xHigh - rlvl) <= rlvl * tpProxPct / 100
             nearTP := true
-            nearReason := "0.83% reversal (" + str.tostring(int(threshUpMain)) + "pt) off weekly low"
+            if na(nearReason)
+                nearReason := "0.83% reversal (" + str.tostring(int(threshUpMain)) + "pt) off weekly low, touched " + formatPrice(rlvl)
     for i = 1 to tpLevels
         float lvl = wLow + tpStepUpMain * i
         if not na(lvl) and lvl > 0 and math.abs(xHigh - lvl) <= lvl * tpProxPct / 100
             nearTP := true
-            nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepUpMain * i)) + "pt) off weekly low"
+            if na(nearReason)
+                nearReason := "TP" + str.tostring(i) + " sweep (" + str.tostring(int(tpStepUpMain * i)) + "pt) off weekly low, touched " + formatPrice(lvl)
 bool entryTrigger = useTPEntry ? nearTP : true
 
 // Weekly-open filter with an openTolPct % tolerance band: a LONG (fades a dip) is allowed BELOW the weekly
@@ -470,20 +474,32 @@ bool entryTrigger = useTPEntry ? nearTP : true
 bool openOkLong  = not na(weekOpen) and xClose < weekOpen * (1 + openTolPct / 100)
 bool openOkShort = not na(weekOpen) and xClose > weekOpen * (1 - openTolPct / 100)
 
+// Shared entry/exit signal flags - set inside whichever branch fires, then read once at the bottom for the
+// plotshape markers and alertcondition()s (Pine requires those calls at the top level, not nested in ifs).
+bool   longEntrySig  = false
+bool   shortEntrySig = false
+bool   exitSig       = false
+string exitDir       = na
+float  exitPx        = na
+float  exitEntryPx   = na
+string exitWhy       = na
+
 if inWarnWindow and not tradedWindow and na(posDir) and not na(dir) and entryTrigger and xNewBar
     if dir == "down" and enableLongs and openOkLong
-        longReason = "LONG - bearish into window, reversal UP: " + (useTPEntry ? nearReason : "window start (no TP-sweep filter)")
         posDir := "long"
         posAvgPrice := xClose
+        longEntrySig := true
+        longReason = "LONG @ " + formatPrice(posAvgPrice) + "\nFade for reversal UP (bearish into window)\n" + (useTPEntry ? nearReason : "Window start (no TP-sweep filter)") + "\nBelow weekly open " + formatPrice(weekOpen)
         if showReasons
-            label.new(bar_index, xLow, longReason, style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+            label.new(bar_index, xLow, longReason, style=label.style_label_up, yloc=yloc.belowbar, color=color.new(color.green, 15), textcolor=color.white, size=size.small)
         tradedWindow := true
     else if dir == "up" and enableShorts and openOkShort
-        shortReason = "SHORT - bullish into window, reversal DOWN: " + (useTPEntry ? nearReason : "window start (no TP-sweep filter)")
         posDir := "short"
         posAvgPrice := xClose
+        shortEntrySig := true
+        shortReason = "SHORT @ " + formatPrice(posAvgPrice) + "\nFade for reversal DOWN (bullish into window)\n" + (useTPEntry ? nearReason : "Window start (no TP-sweep filter)") + "\nAbove weekly open " + formatPrice(weekOpen)
         if showReasons
-            label.new(bar_index, xHigh, shortReason, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+            label.new(bar_index, xHigh, shortReason, style=label.style_label_down, yloc=yloc.abovebar, color=color.new(color.red, 15), textcolor=color.white, size=size.small)
         tradedWindow := true
 
 // ---- Exit ----
@@ -546,28 +562,38 @@ plot(showTrailPlot and useTrailStop and posDir == "short" ? trailLevelShort : na
 // takes priority over the TP-flip/force-exit checks below within the same bar (matches the strategy's
 // "protective stop is always active" priority).
 if useStop and posDir == "long" and not na(longStopLevel) and xLow <= longStopLevel
-    if showReasons
-        label.new(bar_index, longStopLevel, longStopReason, style=label.style_label_up, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+    exitSig := true
+    exitDir := "long"
+    exitPx := longStopLevel
+    exitEntryPx := posAvgPrice
+    exitWhy := longStopReason
     posDir := na
     posAvgPrice := na
 if useStop and posDir == "short" and not na(shortStopLevel) and xHigh >= shortStopLevel
-    if showReasons
-        label.new(bar_index, shortStopLevel, shortStopReason, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+    exitSig := true
+    exitDir := "short"
+    exitPx := shortStopLevel
+    exitEntryPx := posAvgPrice
+    exitWhy := shortStopReason
     posDir := na
     posAvgPrice := na
 
 // TP-flip exit - only from the window-end day's window-end time onward, assessed once per locked bar.
 if afterWindowEnd and xNewBar
     if posDir == "long" and mode == "down"
-        flipReason = "LONG exit - trend flipped DOWN (up-TP became resistance)"
-        if showReasons
-            label.new(bar_index, xClose, flipReason, style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
+        exitSig := true
+        exitDir := "long"
+        exitPx := xClose
+        exitEntryPx := posAvgPrice
+        exitWhy := "Trend flipped DOWN (up-TP became resistance)"
         posDir := na
         posAvgPrice := na
     if posDir == "short" and mode == "up"
-        flipReason = "SHORT exit - trend flipped UP (down-TP became support)"
-        if showReasons
-            label.new(bar_index, xClose, flipReason, style=label.style_label_up, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
+        exitSig := true
+        exitDir := "short"
+        exitPx := xClose
+        exitEntryPx := posAvgPrice
+        exitWhy := "Trend flipped UP (down-TP became support)"
         posDir := na
         posAvgPrice := na
 
@@ -575,15 +601,36 @@ if afterWindowEnd and xNewBar
 // safety net only.
 if forceExit and xNewBar
     if not na(posDir)
-        timeReason = "Force exit - window-end time reached, no weekend hold"
-        if showReasons
-            label.new(bar_index, xClose, timeReason, style=label.style_label_left, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+        exitSig := true
+        exitDir := posDir
+        exitPx := xClose
+        exitEntryPx := posAvgPrice
+        exitWhy := "Window-end time reached, no weekend hold"
         posDir := na
         posAvgPrice := na
 else if ta.change(time("W")) != 0
     if not na(posDir)
-        safetyReason = "Week rollover - safety close"
-        if showReasons
-            label.new(bar_index, xClose, safetyReason, style=label.style_label_left, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+        exitSig := true
+        exitDir := posDir
+        exitPx := xClose
+        exitEntryPx := posAvgPrice
+        exitWhy := "Week rollover - safety close"
         posDir := na
         posAvgPrice := na
+
+// ---- Draw the exit label with price + reason + P&L in points ----
+if showReasons and exitSig
+    float pnl = exitDir == "long" ? exitPx - exitEntryPx : exitEntryPx - exitPx
+    bool win = pnl >= 0
+    exitLabel = "EXIT " + (exitDir == "long" ? "LONG" : "SHORT") + " @ " + formatPrice(exitPx) + "\n" + exitWhy + "\n" + (win ? "+" : "") + formatPrice(pnl) + " pts"
+    label.new(bar_index, exitPx, exitLabel, style=exitDir == "long" ? label.style_label_down : label.style_label_up, color=color.new(win ? color.teal : color.maroon, 15), textcolor=color.white, size=size.small)
+
+// ---- Clean directional shapes alongside the detailed labels ----
+plotshape(showReasons and longEntrySig,  title="Long entry",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(showReasons and shortEntrySig, title="Short entry", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.tiny)
+plotshape(showReasons and exitSig ? exitPx : na, title="Exit", style=shape.xcross, location=location.absolute, color=color.gray, size=size.tiny)
+
+// ---- Alerts ----
+alertcondition(longEntrySig,  title="Long entry",  message="Weekly TP Reversal: LONG entry signal")
+alertcondition(shortEntrySig, title="Short entry", message="Weekly TP Reversal: SHORT entry signal")
+alertcondition(exitSig,       title="Exit",        message="Weekly TP Reversal: EXIT signal")

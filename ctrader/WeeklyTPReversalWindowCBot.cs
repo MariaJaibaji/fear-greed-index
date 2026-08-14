@@ -14,12 +14,12 @@
 //     stop distance, capped by a hard max-lots safety backstop.
 //   - Take Profit At Confirmed TP Level - a close-confirmed profit target using the same support/
 //     resistance-style confirmation as the trailing stop, reusing the existing TP Increment step.
-//   - EMA Trend Filter - multi-timeframe confluence check (up to 3 independent timeframes, default
-//     H1/H4/Daily): on each enabled timeframe, EMA Fast (default 20) above EMA Slow (default 200) reads
-//     bullish, Slow above Fast reads bearish. A direction is only allowed once at least Minimum
-//     Timeframes Agreeing of the enabled timeframes agree on it. Each EMA Timeframe is its own TimeFrame
-//     parameter, and Minimum Timeframes Agreeing is a plain int, so both are directly optimizable -
-//     cTrader's optimizer can sweep which timeframes and how much agreement works best.
+//   - EMA Trend Filter - multi-timeframe confluence check (up to 5 independent timeframes, default
+//     M5/H1/H6/Daily/Weekly): on each enabled timeframe, EMA Fast (default 21) above EMA Slow (default
+//     253) reads bullish, Slow above Fast reads bearish. A direction is only allowed once at least
+//     Minimum Timeframes Agreeing of the enabled timeframes agree on it. Each EMA Timeframe is its own
+//     TimeFrame parameter, and Minimum Timeframes Agreeing is a plain int, so both are directly
+//     optimizable - cTrader's optimizer can sweep which timeframes and how much agreement works best.
 //
 // NOT ported: the Anchored Volume Profile (purely visual, no effect on trading decisions - skipped by
 // request to keep this file focused on the trading logic).
@@ -83,7 +83,7 @@ namespace cAlgo.Robots
         [Parameter("Trend / Reversal Threshold (% of price)", DefaultValue = 0.83, MinValue = 0.01, Group = "TP Levels")]
         public double TrendThresholdPercent { get; set; }
 
-        [Parameter("Calculation Timeframe", DefaultValue = "Minute5", Group = "TP Levels")]
+        [Parameter("Calculation Timeframe", DefaultValue = "Minute15", Group = "TP Levels")]
         public TimeFrame CalcTimeFrame { get; set; }
 
         [Parameter("Week Start Day", DefaultValue = DayOfWeek.Monday, Group = "TP Levels",
@@ -100,10 +100,10 @@ namespace cAlgo.Robots
             Description = "e.g. 'Europe/London' (IANA) or 'GMT Standard Time' (Windows). Falls back to UTC with a log warning if not found on this system.")]
         public string WarningTimeZoneId { get; set; }
 
-        [Parameter("Warning Start Day", DefaultValue = DayOfWeek.Wednesday, Group = "Reversal Warning")]
+        [Parameter("Warning Start Day", DefaultValue = DayOfWeek.Tuesday, Group = "Reversal Warning")]
         public DayOfWeek WarnStartDay { get; set; }
 
-        [Parameter("Warning Start Hour", DefaultValue = 13, MinValue = 0, MaxValue = 23, Group = "Reversal Warning")]
+        [Parameter("Warning Start Hour", DefaultValue = 19, MinValue = 0, MaxValue = 23, Group = "Reversal Warning")]
         public int WarnStartHour { get; set; }
 
         [Parameter("Warning Start Minute", DefaultValue = 15, MinValue = 0, MaxValue = 59, Group = "Reversal Warning")]
@@ -118,35 +118,47 @@ namespace cAlgo.Robots
         [Parameter("Warning End Minute", DefaultValue = 45, MinValue = 0, MaxValue = 59, Group = "Reversal Warning")]
         public int WarnEndMinute { get; set; }
 
-        [Parameter("Use EMA Trend Filter", DefaultValue = false, Group = "EMA Trend Filter",
-            Description = "Only takes trades aligned with the EMA trend, checked across up to 3 independent timeframes: EMA Fast above EMA Slow = bullish, EMA Slow above EMA Fast = bearish. A direction is only allowed once at least Minimum Timeframes Agreeing of the enabled timeframes agree on it.")]
+        [Parameter("Use EMA Trend Filter", DefaultValue = true, Group = "EMA Trend Filter",
+            Description = "Only takes trades aligned with the EMA trend, checked across up to 5 independent timeframes: EMA Fast above EMA Slow = bullish, EMA Slow above EMA Fast = bearish. A direction is only allowed once at least Minimum Timeframes Agreeing of the enabled timeframes agree on it.")]
         public bool UseEmaTrendFilter { get; set; }
 
-        [Parameter("EMA Fast Period", DefaultValue = 20, MinValue = 1, Group = "EMA Trend Filter",
+        [Parameter("EMA Fast Period", DefaultValue = 21, MinValue = 1, Group = "EMA Trend Filter",
             Description = "Same Fast/Slow periods are used on every enabled EMA timeframe below.")]
         public int EmaFastPeriod { get; set; }
 
-        [Parameter("EMA Slow Period", DefaultValue = 200, MinValue = 1, Group = "EMA Trend Filter")]
+        [Parameter("EMA Slow Period", DefaultValue = 253, MinValue = 1, Group = "EMA Trend Filter")]
         public int EmaSlowPeriod { get; set; }
 
-        [Parameter("EMA Timeframe 1", DefaultValue = "Hour1", Group = "EMA Trend Filter",
+        [Parameter("EMA Timeframe 1", DefaultValue = "Minute5", Group = "EMA Trend Filter",
             Description = "Always active. Directly optimizable as a TimeFrame parameter.")]
         public TimeFrame EmaTimeFrame1 { get; set; }
 
         [Parameter("Use EMA Timeframe 2", DefaultValue = true, Group = "EMA Trend Filter")]
         public bool UseEmaTimeFrame2 { get; set; }
 
-        [Parameter("EMA Timeframe 2", DefaultValue = "Hour4", Group = "EMA Trend Filter")]
+        [Parameter("EMA Timeframe 2", DefaultValue = "Hour1", Group = "EMA Trend Filter")]
         public TimeFrame EmaTimeFrame2 { get; set; }
 
         [Parameter("Use EMA Timeframe 3", DefaultValue = true, Group = "EMA Trend Filter")]
         public bool UseEmaTimeFrame3 { get; set; }
 
-        [Parameter("EMA Timeframe 3", DefaultValue = "Daily", Group = "EMA Trend Filter")]
+        [Parameter("EMA Timeframe 3", DefaultValue = "Hour6", Group = "EMA Trend Filter")]
         public TimeFrame EmaTimeFrame3 { get; set; }
 
-        [Parameter("Minimum Timeframes Agreeing", DefaultValue = 3, MinValue = 1, MaxValue = 3, Group = "EMA Trend Filter",
-            Description = "How many of the ENABLED EMA timeframes must agree on a direction before it's treated as a signal. 3 = strict confluence (all enabled timeframes must agree); 2 = majority; 1 = any single enabled timeframe is enough. If this exceeds the number of enabled timeframes, the filter will never produce a signal.")]
+        [Parameter("Use EMA Timeframe 4", DefaultValue = true, Group = "EMA Trend Filter")]
+        public bool UseEmaTimeFrame4 { get; set; }
+
+        [Parameter("EMA Timeframe 4", DefaultValue = "Daily", Group = "EMA Trend Filter")]
+        public TimeFrame EmaTimeFrame4 { get; set; }
+
+        [Parameter("Use EMA Timeframe 5", DefaultValue = true, Group = "EMA Trend Filter")]
+        public bool UseEmaTimeFrame5 { get; set; }
+
+        [Parameter("EMA Timeframe 5", DefaultValue = "Weekly", Group = "EMA Trend Filter")]
+        public TimeFrame EmaTimeFrame5 { get; set; }
+
+        [Parameter("Minimum Timeframes Agreeing", DefaultValue = 3, MinValue = 1, MaxValue = 5, Group = "EMA Trend Filter",
+            Description = "How many of the ENABLED EMA timeframes must agree on a direction before it's treated as a signal. 5 = strict confluence (all enabled timeframes must agree); lower = majority/partial agreement. If this exceeds the number of enabled timeframes, the filter will never produce a signal.")]
         public int MinTimeframesAgreeing { get; set; }
 
         [Parameter("Trade Longs (bearish-into-window fade)", DefaultValue = true, Group = "Strategy")]
@@ -184,7 +196,7 @@ namespace cAlgo.Robots
         [Parameter("Use Stop Loss", DefaultValue = true, Group = "Strategy")]
         public bool UseStopLoss { get; set; }
 
-        [Parameter("Stop Loss Units", DefaultValue = UnitType.Points, Group = "Strategy")]
+        [Parameter("Stop Loss Units", DefaultValue = UnitType.Percent, Group = "Strategy")]
         public UnitType StopUnit { get; set; }
 
         [Parameter("Stop Loss (points)", DefaultValue = 275, MinValue = 1, Group = "Strategy")]
@@ -197,7 +209,7 @@ namespace cAlgo.Robots
             Description = "Once the Stop Trail Day/Time is reached, the stop steps up to each Trail Step increment as it's confirmed by a close. No breakeven jump - the stop stays at its original distance until the first increment actually confirms.")]
         public bool UseTrailStop { get; set; }
 
-        [Parameter("Trail Step Units", DefaultValue = UnitType.Points, Group = "Strategy")]
+        [Parameter("Trail Step Units", DefaultValue = UnitType.Percent, Group = "Strategy")]
         public UnitType TrailStepUnit { get; set; }
 
         [Parameter("Trail Step (points)", DefaultValue = 500, MinValue = 1, Group = "Strategy")]
@@ -215,11 +227,11 @@ namespace cAlgo.Robots
         [Parameter("Stop Trail Minute", DefaultValue = 0, MinValue = 0, MaxValue = 59, Group = "Strategy")]
         public int TrailMinute { get; set; }
 
-        [Parameter("Take Profit At Confirmed TP Level", DefaultValue = false, Group = "Strategy",
+        [Parameter("Take Profit At Confirmed TP Level", DefaultValue = true, Group = "Strategy",
             Description = "Uses the SAME close-confirmation logic as the reversal threshold and trailing stop: exits once price CLOSES past the target TP increment (the level effectively becomes support/resistance), not on a raw price touch. Reuses the existing TP Increment step - no separate size to tune.")]
         public bool UseTakeProfit { get; set; }
 
-        [Parameter("Take Profit Levels Ahead", DefaultValue = 1, MinValue = 1, MaxValue = 10, Group = "Strategy",
+        [Parameter("Take Profit Levels Ahead", DefaultValue = 2, MinValue = 1, MaxValue = 10, Group = "Strategy",
             Description = "How many TP increments past the weekly extreme must be CLOSE-confirmed before taking profit. 1 = the very next level; higher = wait for a deeper, more confirmed move.")]
         public int TakeProfitLevels { get; set; }
 
@@ -245,10 +257,12 @@ namespace cAlgo.Robots
 
         private Bars _calcBars;
         private Bars _execBars;
-        private Bars _emaBars1, _emaBars2, _emaBars3;
+        private Bars _emaBars1, _emaBars2, _emaBars3, _emaBars4, _emaBars5;
         private ExponentialMovingAverage _emaFast1, _emaSlow1;
         private ExponentialMovingAverage _emaFast2, _emaSlow2;
         private ExponentialMovingAverage _emaFast3, _emaSlow3;
+        private ExponentialMovingAverage _emaFast4, _emaSlow4;
+        private ExponentialMovingAverage _emaFast5, _emaSlow5;
         private TimeZoneInfo _warnTz;
 
         private DateTime? _lastWeekAnchor;
@@ -304,7 +318,22 @@ namespace cAlgo.Robots
                     _emaSlow3 = Indicators.ExponentialMovingAverage(_emaBars3.ClosePrices, EmaSlowPeriod);
                 }
 
-                int enabledCount = 1 + (UseEmaTimeFrame2 ? 1 : 0) + (UseEmaTimeFrame3 ? 1 : 0);
+                if (UseEmaTimeFrame4)
+                {
+                    _emaBars4 = MarketData.GetBars(EmaTimeFrame4, SymbolName);
+                    _emaFast4 = Indicators.ExponentialMovingAverage(_emaBars4.ClosePrices, EmaFastPeriod);
+                    _emaSlow4 = Indicators.ExponentialMovingAverage(_emaBars4.ClosePrices, EmaSlowPeriod);
+                }
+
+                if (UseEmaTimeFrame5)
+                {
+                    _emaBars5 = MarketData.GetBars(EmaTimeFrame5, SymbolName);
+                    _emaFast5 = Indicators.ExponentialMovingAverage(_emaBars5.ClosePrices, EmaFastPeriod);
+                    _emaSlow5 = Indicators.ExponentialMovingAverage(_emaBars5.ClosePrices, EmaSlowPeriod);
+                }
+
+                int enabledCount = 1 + (UseEmaTimeFrame2 ? 1 : 0) + (UseEmaTimeFrame3 ? 1 : 0)
+                                     + (UseEmaTimeFrame4 ? 1 : 0) + (UseEmaTimeFrame5 ? 1 : 0);
                 if (MinTimeframesAgreeing > enabledCount)
                     Print($"Warning: Minimum Timeframes Agreeing ({MinTimeframesAgreeing}) is higher than the number of enabled EMA timeframes ({enabledCount}) - the EMA trend filter will never produce a signal.");
             }
@@ -468,6 +497,18 @@ namespace cAlgo.Robots
             {
                 string t3 = GetSingleEmaTrend(_emaFast3, _emaSlow3);
                 if (t3 != null) readings.Add((EmaTimeFrame3.ToString(), t3));
+            }
+
+            if (UseEmaTimeFrame4)
+            {
+                string t4 = GetSingleEmaTrend(_emaFast4, _emaSlow4);
+                if (t4 != null) readings.Add((EmaTimeFrame4.ToString(), t4));
+            }
+
+            if (UseEmaTimeFrame5)
+            {
+                string t5 = GetSingleEmaTrend(_emaFast5, _emaSlow5);
+                if (t5 != null) readings.Add((EmaTimeFrame5.ToString(), t5));
             }
 
             if (readings.Count == 0) return (null, null);

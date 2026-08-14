@@ -39,6 +39,7 @@ labelSize       = input.string(size.small, "Label Size", options=[size.tiny, siz
 labelTextColor  = input.color(color.white, "Label Text Color", group=grpStyle)
 labelColorBase  = input.color(color.new(color.blue, 0), "Label Color (single TF)", group=grpStyle)
 labelColorMulti = input.color(color.new(color.purple, 0), "Label Color (merged TFs)", group=grpStyle)
+showDebugTable  = input.bool(true, "Show Debug Table (live spread % per TF)", group=grpStyle)
 
 // ---------------- Per-timeframe compression detection ----------------
 f_compression(tf, l1, l2, l3, l4, thresholdPct) =>
@@ -48,23 +49,47 @@ f_compression(tf, l1, l2, l3, l4, thresholdPct) =>
     hi = math.max(math.max(e1, e2), math.max(e3, e4))
     lo = math.min(math.min(e1, e2), math.min(e3, e4))
     mid = (hi + lo) / 2
-    compressed = c != 0 and (hi - lo) / c * 100 <= thresholdPct
-    [compressed, mid]
+    spreadPct = c != 0 ? (hi - lo) / c * 100 : na
+    compressed = c != 0 and spreadPct <= thresholdPct
+    [compressed, mid, spreadPct]
 
 f_tfLabel(tf) => tf == "" ? timeframe.period : tf
 
-[c1, m1] = f_compression(tf1, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
-[c2, m2] = f_compression(tf2, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
-[c3, m3] = f_compression(tf3, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
-[c4, m4] = f_compression(tf4, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
-[c5, m5] = f_compression(tf5, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
-[c6, m6] = f_compression(tf6, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c1, m1, s1] = f_compression(tf1, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c2, m2, s2] = f_compression(tf2, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c3, m3, s3] = f_compression(tf3, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c4, m4, s4] = f_compression(tf4, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c5, m5, s5] = f_compression(tf5, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
+[c6, m6, s6] = f_compression(tf6, ema1Len, ema2Len, ema3Len, ema4Len, compressionPct)
 
 // ---------------- Alert (evaluated every bar) ----------------
 anyCompressedNow = (tf1Enable and c1) or (tf2Enable and c2) or (tf3Enable and c3) or
      (tf4Enable and c4) or (tf5Enable and c5) or (tf6Enable and c6)
 alertcondition(anyCompressedNow and not anyCompressedNow[1], title="EMA Compression Started",
      message="EMA compression detected on at least one timeframe")
+
+// ---------------- Debug table: shows live spread % vs threshold per TF ----------------
+var table debugTable = table.new(position.top_right, 3, 7, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+
+f_debugRow(row, enabled, tf, spreadPct, compressed, thresholdPct) =>
+    nameTxt = enabled ? f_tfLabel(tf) : f_tfLabel(tf) + " (off)"
+    spreadTxt = enabled and not na(spreadPct) ? str.tostring(spreadPct, "#.###") + "%" : "n/a"
+    statusColor = not enabled ? color.new(color.gray, 50) : compressed ? color.new(color.green, 0) : color.new(color.red, 30)
+    statusTxt = not enabled ? "-" : compressed ? "COMPRESSED" : "no"
+    table.cell(debugTable, 0, row, nameTxt, text_color=color.white, text_halign=text.align_left)
+    table.cell(debugTable, 1, row, spreadTxt, text_color=color.white)
+    table.cell(debugTable, 2, row, statusTxt, bgcolor=statusColor, text_color=color.white)
+
+if showDebugTable and barstate.islast
+    table.cell(debugTable, 0, 0, "Timeframe", text_color=color.white, bgcolor=color.new(color.blue, 40), text_halign=text.align_left)
+    table.cell(debugTable, 1, 0, "Spread (thr " + str.tostring(compressionPct, "#.##") + "%)", text_color=color.white, bgcolor=color.new(color.blue, 40))
+    table.cell(debugTable, 2, 0, "Status", text_color=color.white, bgcolor=color.new(color.blue, 40))
+    f_debugRow(1, tf1Enable, tf1, s1, c1, compressionPct)
+    f_debugRow(2, tf2Enable, tf2, s2, c2, compressionPct)
+    f_debugRow(3, tf3Enable, tf3, s3, c3, compressionPct)
+    f_debugRow(4, tf4Enable, tf4, s4, c4, compressionPct)
+    f_debugRow(5, tf5Enable, tf5, s5, c5, compressionPct)
+    f_debugRow(6, tf6Enable, tf6, s6, c6, compressionPct)
 
 // ---------------- Label drawing (only needs the latest bar) ----------------
 var array<label> activeLabels = array.new<label>()

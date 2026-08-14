@@ -14,6 +14,10 @@
 //     stop distance, capped by a hard max-lots safety backstop.
 //   - Take Profit At Confirmed TP Level - a close-confirmed profit target using the same support/
 //     resistance-style confirmation as the trailing stop, reusing the existing TP Increment step.
+//   - EMA Trend Filter - EMA Fast (default 20) above EMA Slow (default 200) = bullish, longs only;
+//     Slow above Fast = bearish, shorts only. Computed on its own EMA Timeframe, independent of the
+//     Calculation/Execution timeframes - EMA Timeframe is itself a TimeFrame parameter, so cTrader's
+//     optimizer can sweep it directly to find which one reads the trend best for this instrument.
 //
 // NOT ported: the Anchored Volume Profile (purely visual, no effect on trading decisions - skipped by
 // request to keep this file focused on the trading logic).
@@ -38,6 +42,7 @@
 using System;
 using System.Linq;
 using cAlgo.API;
+using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
 
 namespace cAlgo.Robots
@@ -109,6 +114,20 @@ namespace cAlgo.Robots
 
         [Parameter("Warning End Minute", DefaultValue = 45, MinValue = 0, MaxValue = 59, Group = "Reversal Warning")]
         public int WarnEndMinute { get; set; }
+
+        [Parameter("Use EMA Trend Filter", DefaultValue = false, Group = "EMA Trend Filter",
+            Description = "Only takes trades aligned with the EMA trend: EMA Fast above EMA Slow = bullish (longs only), EMA Slow above EMA Fast = bearish (shorts only). Computed on its own EMA Timeframe, independent of the Calculation/Execution timeframes.")]
+        public bool UseEmaTrendFilter { get; set; }
+
+        [Parameter("EMA Fast Period", DefaultValue = 20, MinValue = 1, Group = "EMA Trend Filter")]
+        public int EmaFastPeriod { get; set; }
+
+        [Parameter("EMA Slow Period", DefaultValue = 200, MinValue = 1, Group = "EMA Trend Filter")]
+        public int EmaSlowPeriod { get; set; }
+
+        [Parameter("EMA Timeframe", DefaultValue = "Hour4", Group = "EMA Trend Filter",
+            Description = "The timeframe the EMAs are computed on. Directly optimizable as a TimeFrame parameter - sweep this to find which timeframe's trend read works best for this instrument.")]
+        public TimeFrame EmaTimeFrame { get; set; }
 
         [Parameter("Trade Longs (bearish-into-window fade)", DefaultValue = true, Group = "Strategy")]
         public bool EnableLongs { get; set; }
@@ -206,6 +225,9 @@ namespace cAlgo.Robots
 
         private Bars _calcBars;
         private Bars _execBars;
+        private Bars _emaBars;
+        private ExponentialMovingAverage _emaFast;
+        private ExponentialMovingAverage _emaSlow;
         private TimeZoneInfo _warnTz;
 
         private DateTime? _lastWeekAnchor;
@@ -239,6 +261,13 @@ namespace cAlgo.Robots
             {
                 _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
                 _execBars.BarOpened += OnExecBarOpened;
+            }
+
+            if (UseEmaTrendFilter)
+            {
+                _emaBars = MarketData.GetBars(EmaTimeFrame, SymbolName);
+                _emaFast = Indicators.ExponentialMovingAverage(_emaBars.ClosePrices, EmaFastPeriod);
+                _emaSlow = Indicators.ExponentialMovingAverage(_emaBars.ClosePrices, EmaSlowPeriod);
             }
 
             Positions.Closed += OnPositionsClosed;
@@ -375,6 +404,26 @@ namespace cAlgo.Robots
         }
 
         // ---------------------------------------------------------------------------------------------
+        // EMA trend filter
+        // ---------------------------------------------------------------------------------------------
+
+        // EMA Fast above EMA Slow = bullish (only longs allowed); EMA Slow above EMA Fast = bearish (only
+        // shorts allowed). Computed on its own EMA Timeframe, independent of the chart/Calculation/
+        // Execution timeframes, so EMA Timeframe itself can be optimized to find which one reads best.
+        private (string bias, string reason) GetEmaTrendBias()
+        {
+            if (!UseEmaTrendFilter || _emaFast == null || _emaSlow == null) return (null, null);
+
+            double fast = _emaFast.Result.LastValue;
+            double slow = _emaSlow.Result.LastValue;
+            if (double.IsNaN(fast) || double.IsNaN(slow)) return (null, null);
+
+            return fast >= slow
+                ? ("long", $"EMA trend ({EmaTimeFrame}): EMA{EmaFastPeriod} {fast:F2} >= EMA{EmaSlowPeriod} {slow:F2} - bullish, longs only")
+                : ("short", $"EMA trend ({EmaTimeFrame}): EMA{EmaSlowPeriod} {slow:F2} > EMA{EmaFastPeriod} {fast:F2} - bearish, shorts only");
+        }
+
+        // ---------------------------------------------------------------------------------------------
         // Entry / exit orchestration (runs once per locked exec bar, or every chart bar when unlocked)
         // ---------------------------------------------------------------------------------------------
 
@@ -444,21 +493,35 @@ namespace cAlgo.Robots
             bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
             bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
 
+            (string bias, string biasReason) = GetEmaTrendBias();
+            bool longAllowed = EnableLongs && (bias == null || bias == "long");
+            bool shortAllowed = EnableShorts && (bias == null || bias == "short");
+
             if (inWindow && !_tradedWindow && _openPosition == null && dir != null && entryTrigger)
             {
-                if (dir == "down" && EnableLongs && openOkLong)
+                if (dir == "down" && longAllowed && openOkLong)
                 {
                     string reason = "LONG - bearish into window, reversal UP: " +
-                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)");
+                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)") +
+                                     (biasReason != null ? " | " + biasReason : "");
                     OpenPosition(TradeType.Buy, xBar, reason);
                     _tradedWindow = true;
                 }
-                else if (dir == "up" && EnableShorts && openOkShort)
+                else if (dir == "up" && shortAllowed && openOkShort)
                 {
                     string reason = "SHORT - bullish into window, reversal DOWN: " +
-                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)");
+                                     (UseTPEntry ? nearReason : "window start (no TP-sweep filter)") +
+                                     (biasReason != null ? " | " + biasReason : "");
                     OpenPosition(TradeType.Sell, xBar, reason);
                     _tradedWindow = true;
+                }
+                else if (dir == "down" && !longAllowed && EnableLongs && openOkLong)
+                {
+                    Print($"Entry skipped - LONG signal blocked by EMA trend filter ({biasReason})");
+                }
+                else if (dir == "up" && !shortAllowed && EnableShorts && openOkShort)
+                {
+                    Print($"Entry skipped - SHORT signal blocked by EMA trend filter ({biasReason})");
                 }
             }
 

@@ -533,11 +533,18 @@ namespace cAlgo.Robots
                 ? range <= _currentAtr * ConsolidationToleranceAtrMultiple
                 : (avg > 0 && range / avg * 100.0 <= ConsolidationTolerancePercent);
 
+            string detail = haveAtr ? $"{range:F2} vs {_currentAtr * ConsolidationToleranceAtrMultiple:F2} ATR-based" : $"{(avg > 0 ? range / avg * 100.0 : 0):F3}%";
             if (tight)
             {
                 level = (hi + lo) / 2.0;
-                string detail = haveAtr ? $"{range:F2} vs {_currentAtr * ConsolidationToleranceAtrMultiple:F2} ATR-based" : $"{(avg > 0 ? range / avg * 100.0 : 0):F3}%";
                 Print($"Check Time {slot} ({hour:D2}:{minute:D2}) confirmed S/R @ {level:F2} (range {detail} over {n} bars)");
+            }
+            else if (EnableDebugLogging)
+            {
+                // Logged even on a miss (opt-in only, to keep the non-debug log lean) so
+                // ConsolidationTolerancePercent/AtrMultiple and ConsolidationWindowBars can be re-swept
+                // against real range data after the fact, not just the thresholds that happened to pass.
+                Print($"Check Time {slot} ({hour:D2}:{minute:D2}) NOT confirmed - range {detail} over {n} bars, hi={hi:F2} lo={lo:F2}");
             }
         }
 
@@ -572,7 +579,9 @@ namespace cAlgo.Robots
             bool openOkShort = calcBar.Close > _dayOpen - openToleranceAbs;
 
             string atrStr = UseAtrSizing && !double.IsNaN(_currentAtr) ? $"{_currentAtr:F3}" : "n/a";
-            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2} DayHigh={_dayHigh:F2} ATR={atrStr} | Direction={direction ?? "none"} ({directionInfo}) | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
+            // DayMode is logged unconditionally (not just when UseEmaTrendFilter is off) so a future test
+            // of the EMA filter toggled off doesn't need a separate log format - the field is always there.
+            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2} DayHigh={_dayHigh:F2} ATR={atrStr} DayMode={_dayMode ?? "none"} | Direction={direction ?? "none"} ({directionInfo}) | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -763,7 +772,12 @@ namespace cAlgo.Robots
             _movedToBreakeven = false;
             SetInitialStop();
 
-            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units");
+            // FillPrice/Spread are logged separately from the reason text's reference close (which is the
+            // pre-order price used for the S/R proximity check) because a market order can fill a little
+            // away from that reference due to spread/slippage - real PnL reconstruction needs the actual
+            // fill, not the trigger price.
+            double spreadAtEntry = (Symbol.Ask - Symbol.Bid) / Symbol.PipSize;
+            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units | FillPrice={_entryPrice:F2} SpreadPips={spreadAtEntry:F2} Equity={Account.Equity:F2}");
             if (ShowReasons)
                 DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
         }
@@ -879,7 +893,10 @@ namespace cAlgo.Robots
             bool win = pnlPrice >= 0;
             string label = $"EXIT {(_openPosition.TradeType == TradeType.Buy ? "LONG" : "SHORT")} @ {price:F2}\n{reason}\n{(win ? "+" : "")}{pnlPrice:F2} ({(win ? "+" : "")}{pnlPct:F2}%)";
 
-            Print(label.Replace("\n", " | "));
+            // NetProfit/Equity here are read from the LIVE position just before it's closed, so they're the
+            // broker's own authoritative account-currency figures (includes commission/swap if any) rather
+            // than the price-delta math above, which is only an approximation of the true PnL.
+            Print(label.Replace("\n", " | ") + $" | NetProfit={_openPosition.NetProfit:F2} EquityBefore={Account.Equity:F2}");
             if (ShowReasons)
                 DrawReasonLabel(label, time, price, _openPosition.TradeType != TradeType.Buy, win ? Color.Teal : Color.Maroon);
 
@@ -901,7 +918,10 @@ namespace cAlgo.Robots
             string reason = _movedToBreakeven ? "Breakeven stop hit" : "Stop loss hit";
             string label = $"EXIT {(args.Position.TradeType == TradeType.Buy ? "LONG" : "SHORT")} @ {exitPrice:F2}\n{reason}\n{(win ? "+" : "")}{pnlPrice:F2} ({(win ? "+" : "")}{pnlPct:F2}%)";
 
-            Print(label.Replace("\n", " | "));
+            // args.Position is already closed here, so NetProfit is the ACTUAL realized fill - the most
+            // important place to have ground truth, since exitPrice above assumes the stop filled exactly
+            // at the stop level with no slippage, which real broker-side stop orders don't guarantee.
+            Print(label.Replace("\n", " | ") + $" | NetProfit={args.Position.NetProfit:F2} EquityAfter={Account.Equity:F2}");
             if (ShowReasons)
                 DrawReasonLabel(label, Server.TimeInUtc, exitPrice, args.Position.TradeType != TradeType.Buy, win ? Color.Teal : Color.Maroon);
 

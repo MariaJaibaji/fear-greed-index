@@ -200,6 +200,29 @@ namespace cAlgo.Robots
         [Parameter("Trade Shorts", DefaultValue = true, Group = "Strategy")]
         public bool EnableShorts { get; set; }
 
+        [Parameter("Trade Monday", DefaultValue = true, Group = "Strategy",
+            Description = "Per-weekday entry gate, checked against the day's local date (Session Timezone). Added after real backtest data showed uneven performance by weekday - some of it a genuine edge difference, some of it broker swap/rollover charges landing harder on specific weekdays.")]
+        public bool EnableMonday { get; set; }
+
+        [Parameter("Trade Tuesday", DefaultValue = true, Group = "Strategy")]
+        public bool EnableTuesday { get; set; }
+
+        [Parameter("Trade Wednesday", DefaultValue = true, Group = "Strategy")]
+        public bool EnableWednesday { get; set; }
+
+        [Parameter("Trade Thursday", DefaultValue = true, Group = "Strategy")]
+        public bool EnableThursday { get; set; }
+
+        [Parameter("Trade Friday", DefaultValue = true, Group = "Strategy")]
+        public bool EnableFriday { get; set; }
+
+        [Parameter("Trade Saturday", DefaultValue = true, Group = "Strategy")]
+        public bool EnableSaturday { get; set; }
+
+        [Parameter("Trade Sunday", DefaultValue = true, Group = "Strategy",
+            Description = "Some CFD feeds open Sunday evening (session-local) - leave on unless you've confirmed this instrument never trades that day.")]
+        public bool EnableSunday { get; set; }
+
         [Parameter("Entry Proximity %", DefaultValue = 0.088, MinValue = 0.01, Group = "Strategy",
             Description = "How close (as a % of price) price must come to a confirmed check-time S/R level to trigger the entry.")]
         public double EntryProximityPercent { get; set; }
@@ -704,7 +727,7 @@ namespace cAlgo.Robots
             bool openOkLong = xBar.Close < _dayOpen + openToleranceAbs;
             bool openOkShort = xBar.Close > _dayOpen - openToleranceAbs;
 
-            if (!_tradedToday && _openPosition == null && direction != null)
+            if (!_tradedToday && _openPosition == null && direction != null && IsWeekdayEnabled(localTime.DayOfWeek))
             {
                 (double level, int slot) = NearestConfirmedLevel(xBar.Close);
                 bool nearLevel = !double.IsNaN(level) && Math.Abs(xBar.Close - level) <= level * EntryProximityPercent / 100.0;
@@ -734,6 +757,20 @@ namespace cAlgo.Robots
 
             if (_openPosition != null && forceExit)
                 CloseWithReason("Force exit - end-of-day time reached, no overnight hold", xBar.Close, xBar.OpenTime);
+        }
+
+        private bool IsWeekdayEnabled(DayOfWeek dow)
+        {
+            switch (dow)
+            {
+                case DayOfWeek.Monday: return EnableMonday;
+                case DayOfWeek.Tuesday: return EnableTuesday;
+                case DayOfWeek.Wednesday: return EnableWednesday;
+                case DayOfWeek.Thursday: return EnableThursday;
+                case DayOfWeek.Friday: return EnableFriday;
+                case DayOfWeek.Saturday: return EnableSaturday;
+                default: return EnableSunday;
+            }
         }
 
         // Returns the confirmed S/R level closest to the given price, and which check-time slot (1/2/3)

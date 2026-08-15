@@ -30,6 +30,11 @@
 //     trading logic, which is entirely daily-scoped.
 //   - Entry/exit reasoning labels are proper multi-line ChartText (price, why, which check-time level
 //     triggered it, P&L in price and %) instead of one long concatenated line.
+//   - Use ATR-Relative Sizing (off by default): replaces the fixed-% Stop Loss, TP Increment,
+//     Consolidation Tolerance, and Maximum Daily Swing with ATR-multiple equivalents computed on the
+//     Calculation Timeframe. Chosen as the highest-leverage addition for surviving choppy/trending/
+//     high-volatility regimes without re-tuning, since it touches every trade's risk/reward directly
+//     (tighter in calm conditions, wider in volatile ones) rather than just gating whether trades happen.
 //
 // Platform notes (same caveats as the weekly bot):
 //   - The stop loss / breakeven move use a REAL broker-side stop order - accurate, broker-filled.
@@ -115,16 +120,29 @@ namespace cAlgo.Robots
         // ---------------------------------------------------------------------------------------------
 
         [Parameter("TP Increment (% of price)", DefaultValue = 1.66, MinValue = 0.01, Group = "Daily Levels",
-            Description = "TP ladder step, as a % of the day's running low (for up-levels) / high (for down-levels). Percent-only in this bot.")]
+            Description = "TP ladder step, as a % of the day's running low (for up-levels) / high (for down-levels). Used unless Use ATR-Relative Sizing is on.")]
         public double TpStepPercent { get; set; }
 
         [Parameter("Maximum Daily Swing From Open %", DefaultValue = 0.83, MinValue = 0.01, Group = "Daily Levels",
-            Description = "How far (as a %) the close must move from the day's open before the day is read as bullish (up) or bearish (down). Used as the fallback direction source when the EMA filter is off.")]
+            Description = "How far (as a %) the close must move from the day's open before the day is read as bullish (up) or bearish (down). Used unless Use ATR-Relative Sizing is on.")]
         public double MaxDailySwingPercent { get; set; }
 
         [Parameter("Calculation Timeframe", DefaultValue = "Minute15", Group = "Daily Levels",
-            Description = "Timeframe used for daily open/high/low tracking and the check-time consolidation analysis.")]
+            Description = "Timeframe used for daily open/high/low tracking, the check-time consolidation analysis, and the ATR (when ATR-relative sizing is on).")]
         public TimeFrame CalcTimeFrame { get; set; }
+
+        [Parameter("Use ATR-Relative Sizing", DefaultValue = false, Group = "Daily Levels",
+            Description = "Replaces the fixed-% Stop Loss, TP Increment, Consolidation Tolerance, and Maximum Daily Swing with ATR-multiple equivalents below, computed on the Calculation Timeframe. Lets the bot self-adjust to the current volatility regime (tighter in calm conditions, wider in volatile ones) instead of assuming one fixed % forever - the single biggest lever for surviving choppy vs trending vs high-volatility conditions without re-tuning.")]
+        public bool UseAtrSizing { get; set; }
+
+        [Parameter("ATR Period", DefaultValue = 14, MinValue = 1, Group = "Daily Levels")]
+        public int AtrPeriod { get; set; }
+
+        [Parameter("TP Increment (ATR multiple)", DefaultValue = 3.0, MinValue = 0.1, Group = "Daily Levels")]
+        public double TpStepAtrMultiple { get; set; }
+
+        [Parameter("Maximum Daily Swing (ATR multiple)", DefaultValue = 1.5, MinValue = 0.1, Group = "Daily Levels")]
+        public double MaxDailySwingAtrMultiple { get; set; }
 
         [Parameter("Show Weekly High/Low", DefaultValue = true, Group = "Daily Levels",
             Description = "Purely visual reference lines - independent of the (entirely daily-scoped) trading logic.")]
@@ -160,8 +178,12 @@ namespace cAlgo.Robots
         public int CheckTime3Minute { get; set; }
 
         [Parameter("Consolidation Tolerance %", DefaultValue = 0.2, MinValue = 0.01, Group = "Daily S/R Check Times",
-            Description = "A check time is confirmed as support/resistance if price stayed within this % range over the Consolidation Window leading up to it.")]
+            Description = "A check time is confirmed as support/resistance if price stayed within this % range over the Consolidation Window leading up to it. Used unless Use ATR-Relative Sizing is on.")]
         public double ConsolidationTolerancePercent { get; set; }
+
+        [Parameter("Consolidation Tolerance (ATR multiple)", DefaultValue = 0.15, MinValue = 0.01, Group = "Daily S/R Check Times",
+            Description = "Used instead of the % version when Use ATR-Relative Sizing is on.")]
+        public double ConsolidationToleranceAtrMultiple { get; set; }
 
         [Parameter("Consolidation Window (bars)", DefaultValue = 3, MinValue = 1, Group = "Daily S/R Check Times",
             Description = "How many Calculation Timeframe bars (including the one at the check time) are examined for tightness.")]
@@ -200,8 +222,13 @@ namespace cAlgo.Robots
         [Parameter("Use Stop Loss", DefaultValue = true, Group = "Strategy")]
         public bool UseStopLoss { get; set; }
 
-        [Parameter("Stop Loss (% of entry)", DefaultValue = 0.75, MinValue = 0.01, Group = "Strategy")]
+        [Parameter("Stop Loss (% of entry)", DefaultValue = 0.75, MinValue = 0.01, Group = "Strategy",
+            Description = "Used unless Use ATR-Relative Sizing is on (see Daily Levels group).")]
         public double StopLossPercent { get; set; }
+
+        [Parameter("Stop Loss (ATR multiple)", DefaultValue = 1.5, MinValue = 0.1, Group = "Strategy",
+            Description = "Used instead of the % version when Use ATR-Relative Sizing is on.")]
+        public double StopLossAtrMultiple { get; set; }
 
         [Parameter("Move SL To Breakeven", DefaultValue = false, Group = "Strategy",
             Description = "Once BOTH conditions are met - price has moved at least Breakeven Trigger % in the trade's favor, AND it's past the Breakeven Time of day - the stop is tightened to breakeven and left there. One-shot: it never loosens, and never moves again afterward.")]
@@ -239,6 +266,8 @@ namespace cAlgo.Robots
 
         private Bars _calcBars;
         private Bars _execBars; // hardcoded Minute1
+        private AverageTrueRange _atr;
+        private double _currentAtr = double.NaN;
         private Bars _emaBars1, _emaBars2, _emaBars3, _emaBars4, _emaBars5, _emaBars6, _emaBars7;
         private ExponentialMovingAverage _emaFast1, _emaSlow1;
         private ExponentialMovingAverage _emaFast2, _emaSlow2;
@@ -282,6 +311,9 @@ namespace cAlgo.Robots
 
             _calcBars = MarketData.GetBars(CalcTimeFrame, SymbolName);
             _calcBars.BarOpened += OnCalcBarOpened;
+
+            if (UseAtrSizing)
+                _atr = Indicators.AverageTrueRange(_calcBars, AtrPeriod, MovingAverageType.WilderSmoothing);
 
             _execBars = MarketData.GetBars(TimeFrame.Minute, SymbolName); // locked to 1 minute, no toggle
             _execBars.BarOpened += OnExecBarOpened;
@@ -435,11 +467,18 @@ namespace cAlgo.Robots
                 if (bar.Low < _dayLow) _dayLow = bar.Low;
             }
 
-            _tpStepUp = _dayLow * TpStepPercent / 100.0;
-            _tpStepDn = _dayHigh * TpStepPercent / 100.0;
+            _currentAtr = UseAtrSizing && _atr != null ? _atr.Result.LastValue : double.NaN;
+            bool haveAtr = UseAtrSizing && !double.IsNaN(_currentAtr);
 
-            bool bullSignal = bar.Close >= _dayOpen * (1 + MaxDailySwingPercent / 100.0);
-            bool bearSignal = bar.Close <= _dayOpen * (1 - MaxDailySwingPercent / 100.0);
+            // TP ladder step and the daily-swing direction threshold both switch to ATR multiples when
+            // Use ATR-Relative Sizing is on, so the bot self-adjusts to the current volatility regime
+            // instead of assuming one fixed % forever.
+            _tpStepUp = haveAtr ? _currentAtr * TpStepAtrMultiple : _dayLow * TpStepPercent / 100.0;
+            _tpStepDn = haveAtr ? _currentAtr * TpStepAtrMultiple : _dayHigh * TpStepPercent / 100.0;
+
+            double swingThreshold = haveAtr ? _currentAtr * MaxDailySwingAtrMultiple : _dayOpen * MaxDailySwingPercent / 100.0;
+            bool bullSignal = bar.Close >= _dayOpen + swingThreshold;
+            bool bearSignal = bar.Close <= _dayOpen - swingThreshold;
             if (bullSignal && !bearSignal) _dayMode = "up";
             else if (bearSignal && !bullSignal) _dayMode = "down";
 
@@ -486,12 +525,18 @@ namespace cAlgo.Robots
                 sum += b.Close;
             }
             double avg = sum / n;
-            double rangePct = avg > 0 ? (hi - lo) / avg * 100.0 : double.MaxValue;
+            double range = hi - lo;
 
-            if (rangePct <= ConsolidationTolerancePercent)
+            bool haveAtr = UseAtrSizing && !double.IsNaN(_currentAtr);
+            bool tight = haveAtr
+                ? range <= _currentAtr * ConsolidationToleranceAtrMultiple
+                : (avg > 0 && range / avg * 100.0 <= ConsolidationTolerancePercent);
+
+            if (tight)
             {
                 level = (hi + lo) / 2.0;
-                Print($"Check Time {slot} ({hour:D2}:{minute:D2}) confirmed S/R @ {level:F2} (range {rangePct:F3}% over {n} bars)");
+                string detail = haveAtr ? $"{range:F2} vs {_currentAtr * ConsolidationToleranceAtrMultiple:F2} ATR-based" : $"{(avg > 0 ? range / avg * 100.0 : 0):F3}%";
+                Print($"Check Time {slot} ({hour:D2}:{minute:D2}) confirmed S/R @ {level:F2} (range {detail} over {n} bars)");
             }
         }
 
@@ -652,7 +697,7 @@ namespace cAlgo.Robots
         private void OpenPosition(TradeType type, Bar xBar, string reason)
         {
             double estEntry = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
-            double estStopDist = UseStopLoss ? estEntry * StopLossPercent / 100.0 : 0;
+            double estStopDist = UseStopLoss ? StopDistance(estEntry) : 0;
 
             double volumeInUnits = UseStopLoss && estStopDist > 0
                 ? CalculateVolume(estStopDist)
@@ -704,9 +749,18 @@ namespace cAlgo.Robots
         {
             if (!UseStopLoss || _openPosition == null) return;
 
-            double dist = _entryPrice * StopLossPercent / 100.0;
+            double dist = StopDistance(_entryPrice);
             double level = _openPosition.TradeType == TradeType.Buy ? _entryPrice - dist : _entryPrice + dist;
             _openPosition.ModifyStopLossPrice(level);
+        }
+
+        // Stop distance switches to an ATR multiple when Use ATR-Relative Sizing is on, otherwise it's
+        // the fixed % of entry price.
+        private double StopDistance(double price)
+        {
+            if (UseAtrSizing && !double.IsNaN(_currentAtr))
+                return _currentAtr * StopLossAtrMultiple;
+            return price * StopLossPercent / 100.0;
         }
 
         // One-shot: once price has moved BreakevenTriggerPercent in the trade's favor AND it's past

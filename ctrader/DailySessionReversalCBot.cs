@@ -601,7 +601,28 @@ namespace cAlgo.Robots
             // checked against the check-times or any other time-of-day pattern after the fact.
             string dayHighTimeStr = _dayHighTime.HasValue ? TimeZoneInfo.ConvertTimeFromUtc(_dayHighTime.Value, _sessionTz).ToString("HH:mm") : "n/a";
             string dayLowTimeStr = _dayLowTime.HasValue ? TimeZoneInfo.ConvertTimeFromUtc(_dayLowTime.Value, _sessionTz).ToString("HH:mm") : "n/a";
-            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2}@{dayLowTimeStr} DayHigh={_dayHigh:F2}@{dayHighTimeStr} ATR={atrStr} DayMode={_dayMode ?? "none"} SpreadPips={spreadNow:F2} | Direction={direction ?? "none"} ({directionInfo}) | EMAvals: {emaValsStr} | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
+
+            // Open-trade progress toward TP/breakeven - otherwise these only ever show up at the instant
+            // they fire, with no visibility into how close a still-open trade was on bars that didn't
+            // trigger anything (useful for tuning TakeProfitLevels/TpStepPercent and the breakeven params).
+            string tradeProgress = "n/a (no open position)";
+            if (_openPosition != null)
+            {
+                bool isLong = _openPosition.TradeType == TradeType.Buy;
+                double tpStep = isLong ? _tpStepUp : _tpStepDn;
+                int tpSteps = tpStep > 0
+                    ? (int)Math.Floor(Math.Max((isLong ? calcBar.Close - _dayLow : _dayHigh - calcBar.Close), 0) / tpStep)
+                    : 0;
+                double movedPct = isLong
+                    ? (calcBar.Close - _entryPrice) / _entryPrice * 100.0
+                    : (_entryPrice - calcBar.Close) / _entryPrice * 100.0;
+                string beInfo = UseMoveToBreakeven
+                    ? $"BEmoved={_movedToBreakeven} movedPct={movedPct:F3}% (need {BreakevenTriggerPercent}% past {BreakevenTimeHour:D2}:{BreakevenTimeMinute:D2})"
+                    : "BE off";
+                tradeProgress = $"TPsteps={tpSteps}/{TakeProfitLevels} (tpStep={tpStep:F2}) movedPct={movedPct:F3}% {beInfo}";
+            }
+
+            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2}@{dayLowTimeStr} DayHigh={_dayHigh:F2}@{dayHighTimeStr} ATR={atrStr} DayMode={_dayMode ?? "none"} SpreadPips={spreadNow:F2} | Direction={direction ?? "none"} ({directionInfo}) | EMAvals: {emaValsStr} | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)} [{tradeProgress}]");
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -751,8 +772,9 @@ namespace cAlgo.Robots
             double estEntry = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
             double estStopDist = UseStopLoss ? StopDistance(estEntry) : 0;
 
+            bool volumeCapped = false;
             double volumeInUnits = UseStopLoss && estStopDist > 0
-                ? CalculateVolume(estStopDist)
+                ? CalculateVolume(estStopDist, out volumeCapped)
                 : Symbol.NormalizeVolumeInUnits(Symbol.QuantityToVolumeInUnits(FallbackVolumeLots));
 
             // The order comment is a single line (cTrader's Positions/History grid doesn't render \n
@@ -780,13 +802,17 @@ namespace cAlgo.Robots
             // recomputation from StopLossPercent/ATR - removes any doubt about what distance was really
             // used, especially under Use ATR-Relative Sizing where the distance depends on ATR at that instant.
             string stopStr = _openPosition.StopLoss.HasValue ? $"{_openPosition.StopLoss.Value:F2}" : "none";
-            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units | FillPrice={_entryPrice:F2} StopLossPrice={stopStr} SpreadPips={spreadAtEntry:F2} Equity={Account.Equity:F2}");
+            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units (MaxLotsCapped={volumeCapped}) | FillPrice={_entryPrice:F2} StopLossPrice={stopStr} SpreadPips={spreadAtEntry:F2} Equity={Account.Equity:F2}");
             if (ShowReasons)
                 DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
         }
 
-        private double CalculateVolume(double stopDistance)
+        // wasCapped tells the caller whether MaxVolumeLots actually reduced the risk-% sized volume, so the
+        // log can show it directly instead of it being an invisible silent cap - relevant for checking
+        // whether position sizing keeps pace with equity growth (a hard cap binding would show up here).
+        private double CalculateVolume(double stopDistance, out bool wasCapped)
         {
+            wasCapped = false;
             if (stopDistance <= 0) return Symbol.VolumeInUnitsMin;
 
             double riskAmount = Account.Equity * RiskPercent / 100.0;
@@ -798,6 +824,7 @@ namespace cAlgo.Robots
             double volumeInUnits = lots * Symbol.LotSize;
 
             double maxUnits = Symbol.QuantityToVolumeInUnits(MaxVolumeLots);
+            if (volumeInUnits > maxUnits) wasCapped = true;
             volumeInUnits = Math.Min(volumeInUnits, maxUnits);
 
             volumeInUnits = Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down);

@@ -571,7 +571,8 @@ namespace cAlgo.Robots
             bool openOkLong = calcBar.Close < _dayOpen + openToleranceAbs;
             bool openOkShort = calcBar.Close > _dayOpen - openToleranceAbs;
 
-            Print($"[DEBUG] Close={calcBar.Close:F2} DayOpen={_dayOpen:F2} | Direction={direction ?? "none"} ({directionInfo}) | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
+            string atrStr = UseAtrSizing && !double.IsNaN(_currentAtr) ? $"{_currentAtr:F3}" : "n/a";
+            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2} DayHigh={_dayHigh:F2} ATR={atrStr} | Direction={direction ?? "none"} ({directionInfo}) | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
         }
 
         // ---------------------------------------------------------------------------------------------

@@ -251,6 +251,10 @@ namespace cAlgo.Robots
         [Parameter("Show Entry/Exit Reasoning Labels", DefaultValue = true, Group = "Strategy")]
         public bool ShowReasons { get; set; }
 
+        [Parameter("Enable Debug Logging", DefaultValue = false, Group = "Strategy",
+            Description = "Prints one diagnostic line per Calculation Timeframe bar: the close's % distance from the weekly high/low, current mode/window direction, EMA confluence state (and why, including counts even with no signal yet), nearest TP/reversal level and its distance vs Entry Proximity %, and the weekly-open tolerance state - use this to see exactly which gate is blocking an entry, or to send the log back for parameter tuning.")]
+        public bool EnableDebugLogging { get; set; }
+
         [Parameter("Force-Exit Hour (window-end day)", DefaultValue = 21, MinValue = 0, MaxValue = 23, Group = "Strategy")]
         public int ExitHour { get; set; }
 
@@ -475,6 +479,87 @@ namespace cAlgo.Robots
             else if (bearSignal && !bullSignal) _mode = "down";
 
             if (ShowWeekLines) DrawWeekLines(bar.OpenTime);
+
+            if (EnableDebugLogging) LogDebugState(bar);
+        }
+
+        // Nearest reversal-threshold / TP-ladder level to refPrice for the given direction, mirroring the
+        // same levels EvaluateTradingLogic checks against xBar.Low/xBar.High - used only for diagnostics.
+        private (double level, string desc) NearestReversalLevel(string dir, double refPrice)
+        {
+            double bestLevel = double.NaN;
+            string bestDesc = null;
+            double bestDist = double.MaxValue;
+
+            void Consider(double lvl, string desc)
+            {
+                if (lvl <= 0) return;
+                double dist = Math.Abs(refPrice - lvl);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestLevel = lvl;
+                    bestDesc = desc;
+                }
+            }
+
+            if (dir == "down")
+            {
+                if (EntryAtReversal) Consider(_weekHigh - _threshDn, "reversal threshold");
+                for (int i = 1; i <= TpLevelsCount; i++) Consider(_weekHigh - _tpStepDn * i, $"TP{i}");
+            }
+            else if (dir == "up")
+            {
+                if (EntryAtReversal) Consider(_weekLow + _threshUp, "reversal threshold");
+                for (int i = 1; i <= TpLevelsCount; i++) Consider(_weekLow + _tpStepUp * i, $"TP{i}");
+            }
+
+            return (bestLevel, bestDesc);
+        }
+
+        // One line per Calculation Timeframe bar (opt-in via Enable Debug Logging) showing every AND-ed
+        // entry gate: how far the close sits from the weekly high/low (the reversal setup itself), the
+        // current mode/window direction, EMA confluence state, nearest TP/reversal level and its distance
+        // vs Entry Proximity %, and the weekly-open tolerance check. Send this log back to have parameters
+        // tuned against real gate-by-gate behavior instead of guesswork.
+        private void LogDebugState(Bar bar)
+        {
+            double pctFromHigh = !double.IsNaN(_weekHigh) && _weekHigh != 0 ? (_weekHigh - bar.Close) / _weekHigh * 100.0 : double.NaN;
+            double pctFromLow = !double.IsNaN(_weekLow) && _weekLow != 0 ? (bar.Close - _weekLow) / _weekLow * 100.0 : double.NaN;
+
+            var (inWindow, _, _, _) = GetWindowState(bar.OpenTime);
+            string dir = _warnTrend ?? _mode;
+
+            (string bias, string biasReason) = GetEmaTrendBias();
+
+            string levelInfo;
+            if (dir == null)
+            {
+                levelInfo = "no mode/direction yet (close hasn't cleared the reversal threshold off either weekly extreme)";
+            }
+            else if (!UseTPEntry)
+            {
+                levelInfo = "TP-sweep filter off - entry triggers at window start regardless of level proximity";
+            }
+            else
+            {
+                (double lvl, string desc) = NearestReversalLevel(dir, bar.Close);
+                if (double.IsNaN(lvl))
+                {
+                    levelInfo = $"dir={dir}, no valid level (check TP Levels Count / thresholds)";
+                }
+                else
+                {
+                    double distPct = lvl != 0 ? Math.Abs(bar.Close - lvl) / lvl * 100.0 : double.NaN;
+                    bool near = distPct <= EntryProximityPercent;
+                    levelInfo = $"nearest {desc} @ {lvl:F2}, {distPct:F3}% away, need <= {EntryProximityPercent}% -> {(near ? "WITHIN RANGE" : "too far")}";
+                }
+            }
+
+            bool openOkLong = !double.IsNaN(_weekOpen) && bar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
+            bool openOkShort = !double.IsNaN(_weekOpen) && bar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
+
+            Print($"[DEBUG] Close={bar.Close:F2} WeekOpen={_weekOpen:F2} WeekHigh={_weekHigh:F2} ({pctFromHigh:F3}% below) WeekLow={_weekLow:F2} ({pctFromLow:F3}% above) | Mode={_mode ?? "none"} WindowDir={dir ?? "none"} InWindow={inWindow} | EMA={(bias ?? "none")} ({biasReason ?? "n/a"}) | {levelInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedWindow={_tradedWindow} OpenPosition={(_openPosition != null)}");
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -553,7 +638,8 @@ namespace cAlgo.Robots
                 if (t7 != null) readings.Add((EmaTimeFrame7.ToString(), t7));
             }
 
-            if (readings.Count == 0) return (null, null);
+            if (readings.Count == 0)
+                return (null, "No EMA readings yet - every enabled timeframe is still NaN (needs EMA Slow Period bars of history on that timeframe to warm up)");
 
             int longCount = readings.Count(r => r.trend == "long");
             int shortCount = readings.Count(r => r.trend == "short");
@@ -564,7 +650,7 @@ namespace cAlgo.Robots
             if (shortCount >= MinTimeframesAgreeing)
                 return ("short", $"EMA confluence {shortCount}/{readings.Count} bearish ({detail}) - shorts only");
 
-            return (null, null);
+            return (null, $"No confluence yet: {longCount} long / {shortCount} short of {readings.Count} readings warmed up, need {MinTimeframesAgreeing} to agree ({detail})");
         }
 
         private string GetSingleEmaTrend(ExponentialMovingAverage fast, ExponentialMovingAverage slow)

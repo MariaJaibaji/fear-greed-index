@@ -265,6 +265,10 @@ namespace cAlgo.Robots
         [Parameter("Show Entry/Exit Reasoning Labels", DefaultValue = true, Group = "Strategy")]
         public bool ShowReasons { get; set; }
 
+        [Parameter("Enable Debug Logging", DefaultValue = false, Group = "Strategy",
+            Description = "Prints one diagnostic line per Calculation Timeframe bar showing the EMA direction (and why, including confluence counts), the confirmed S/R levels, distance to the nearest one, and the open-tolerance state - use this to see exactly which gate is blocking an entry when no trades are firing.")]
+        public bool EnableDebugLogging { get; set; }
+
         // ---------------------------------------------------------------------------------------------
         // State
         // ---------------------------------------------------------------------------------------------
@@ -504,6 +508,8 @@ namespace cAlgo.Robots
                 if (bar.Low < _weekLowVisual) _weekLowVisual = bar.Low;
             }
             if (ShowWeeklyLines) DrawWeekLines(bar.OpenTime);
+
+            if (EnableDebugLogging) LogDebugState(bar);
         }
 
         // Confirms a check time as a support/resistance level if the last ConsolidationWindowBars calc
@@ -543,6 +549,39 @@ namespace cAlgo.Robots
                 string detail = haveAtr ? $"{range:F2} vs {_currentAtr * ConsolidationToleranceAtrMultiple:F2} ATR-based" : $"{(avg > 0 ? range / avg * 100.0 : 0):F3}%";
                 Print($"Check Time {slot} ({hour:D2}:{minute:D2}) confirmed S/R @ {level:F2} (range {detail} over {n} bars)");
             }
+        }
+
+        // One line per Calculation Timeframe bar (opt-in via Enable Debug Logging) showing the state of
+        // every AND-ed entry gate: EMA direction (and why), nearest confirmed S/R level and distance,
+        // and the open-tolerance side check. Use this to pinpoint which gate is blocking entries instead
+        // of guessing at parameters.
+        private void LogDebugState(Bar calcBar)
+        {
+            (string emaBias, string emaReason) = GetEmaTrendBias();
+            string direction = UseEmaTrendFilter ? emaBias : _dayMode;
+            string directionInfo = UseEmaTrendFilter ? (emaReason ?? "n/a") : $"Daily-swing mode: {_dayMode ?? "none"} (>= {MaxDailySwingPercent}% from open {_dayOpen:F2})";
+
+            (double level, int slot) = NearestConfirmedLevel(calcBar.Close);
+            string nearInfo;
+            if (double.IsNaN(level))
+            {
+                nearInfo = "no confirmed S/R level yet today (SR1/2/3 all null)";
+            }
+            else
+            {
+                double distPct = level != 0 ? Math.Abs(calcBar.Close - level) / level * 100.0 : double.NaN;
+                bool near = distPct <= EntryProximityPercent;
+                nearInfo = $"nearest level {level:F2} (slot {slot}), {distPct:F3}% away, need <= {EntryProximityPercent}% -> {(near ? "WITHIN RANGE" : "too far")}";
+            }
+
+            bool haveAtrForOpenTol = UseAtrSizing && !double.IsNaN(_currentAtr);
+            double openToleranceAbs = haveAtrForOpenTol
+                ? _currentAtr * DailyOpenToleranceAtrMultiple
+                : _dayOpen * DailyOpenTolerancePercent / 100.0;
+            bool openOkLong = calcBar.Close < _dayOpen + openToleranceAbs;
+            bool openOkShort = calcBar.Close > _dayOpen - openToleranceAbs;
+
+            Print($"[DEBUG] Close={calcBar.Close:F2} DayOpen={_dayOpen:F2} | Direction={direction ?? "none"} ({directionInfo}) | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -594,7 +633,8 @@ namespace cAlgo.Robots
                 if (t7 != null) readings.Add((EmaTimeFrame7.ToString(), t7));
             }
 
-            if (readings.Count == 0) return (null, null);
+            if (readings.Count == 0)
+                return (null, "No EMA readings yet - every enabled timeframe is still NaN (needs EMA Slow Period bars of history on that timeframe to warm up)");
 
             int longCount = readings.Count(r => r.trend == "long");
             int shortCount = readings.Count(r => r.trend == "short");
@@ -605,7 +645,7 @@ namespace cAlgo.Robots
             if (shortCount >= MinTimeframesAgreeing)
                 return ("short", $"EMA confluence {shortCount}/{readings.Count} bearish ({detail})");
 
-            return (null, null);
+            return (null, $"No confluence yet: {longCount} long / {shortCount} short of {readings.Count} readings warmed up, need {MinTimeframesAgreeing} to agree ({detail})");
         }
 
         private string GetSingleEmaTrend(ExponentialMovingAverage fast, ExponentialMovingAverage slow)

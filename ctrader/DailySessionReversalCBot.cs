@@ -291,6 +291,8 @@ namespace cAlgo.Robots
         private double _dayOpen = double.NaN;
         private double _dayHigh = double.NaN;
         private double _dayLow = double.NaN;
+        private DateTime? _dayHighTime;
+        private DateTime? _dayLowTime;
         private string _dayMode; // "up", "down", or null
         private double _tpStepUp, _tpStepDn;
 
@@ -451,6 +453,8 @@ namespace cAlgo.Robots
                 _dayOpen = bar.Open;
                 _dayHigh = bar.High;
                 _dayLow = bar.Low;
+                _dayHighTime = bar.OpenTime;
+                _dayLowTime = bar.OpenTime;
                 _dayMode = null;
                 _tradedToday = false;
                 _srLevel1 = null;
@@ -462,8 +466,10 @@ namespace cAlgo.Robots
             }
             else
             {
-                if (bar.High > _dayHigh) _dayHigh = bar.High;
-                if (bar.Low < _dayLow) _dayLow = bar.Low;
+                // Time is the Calculation Timeframe bar's open, i.e. accurate to the calc-bar resolution
+                // (e.g. within a 15-minute window), not the exact tick.
+                if (bar.High > _dayHigh) { _dayHigh = bar.High; _dayHighTime = bar.OpenTime; }
+                if (bar.Low < _dayLow) { _dayLow = bar.Low; _dayLowTime = bar.OpenTime; }
             }
 
             _currentAtr = UseAtrSizing && _atr != null ? _atr.Result.LastValue : double.NaN;
@@ -590,7 +596,12 @@ namespace cAlgo.Robots
             // DayMode is logged unconditionally (not just when UseEmaTrendFilter is off) so a future test
             // of the EMA filter toggled off doesn't need a separate log format - the field is always there.
             double spreadNow = Symbol.PipSize > 0 ? (Symbol.Ask - Symbol.Bid) / Symbol.PipSize : 0;
-            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2} DayHigh={_dayHigh:F2} ATR={atrStr} DayMode={_dayMode ?? "none"} SpreadPips={spreadNow:F2} | Direction={direction ?? "none"} ({directionInfo}) | EMAvals: {emaValsStr} | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
+            // Local (session-timezone) time-of-day the running day high/low occurred, accurate to the
+            // Calculation Timeframe bar (e.g. within a 15-minute window) - lets intraday high/low timing be
+            // checked against the check-times or any other time-of-day pattern after the fact.
+            string dayHighTimeStr = _dayHighTime.HasValue ? TimeZoneInfo.ConvertTimeFromUtc(_dayHighTime.Value, _sessionTz).ToString("HH:mm") : "n/a";
+            string dayLowTimeStr = _dayLowTime.HasValue ? TimeZoneInfo.ConvertTimeFromUtc(_dayLowTime.Value, _sessionTz).ToString("HH:mm") : "n/a";
+            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2}@{dayLowTimeStr} DayHigh={_dayHigh:F2}@{dayHighTimeStr} ATR={atrStr} DayMode={_dayMode ?? "none"} SpreadPips={spreadNow:F2} | Direction={direction ?? "none"} ({directionInfo}) | EMAvals: {emaValsStr} | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
         }
 
         // ---------------------------------------------------------------------------------------------

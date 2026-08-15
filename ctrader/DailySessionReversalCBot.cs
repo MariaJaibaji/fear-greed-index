@@ -579,59 +579,58 @@ namespace cAlgo.Robots
             bool openOkShort = calcBar.Close > _dayOpen - openToleranceAbs;
 
             string atrStr = UseAtrSizing && !double.IsNaN(_currentAtr) ? $"{_currentAtr:F3}" : "n/a";
+            // Raw EMA fast/slow values and % separation per timeframe - not just the long/short read - so
+            // the actual EMA levels are visible for tweaking Fast/Slow periods, and separation size is
+            // available as a possible confidence/strength filter (a confluence made of EMAs barely apart
+            // may behave differently than one with wide separation, and only the raw values let that be
+            // tested after the fact).
+            string emaValsStr = UseEmaTrendFilter
+                ? string.Join(" ", CollectEmaDetails().Select(d => $"{d.tf}[{d.fast:F2}/{d.slow:F2},sep={(d.slow != 0 ? (d.fast - d.slow) / d.slow * 100.0 : 0):F3}%]"))
+                : "n/a";
             // DayMode is logged unconditionally (not just when UseEmaTrendFilter is off) so a future test
             // of the EMA filter toggled off doesn't need a separate log format - the field is always there.
-            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2} DayHigh={_dayHigh:F2} ATR={atrStr} DayMode={_dayMode ?? "none"} | Direction={direction ?? "none"} ({directionInfo}) | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
+            double spreadNow = Symbol.PipSize > 0 ? (Symbol.Ask - Symbol.Bid) / Symbol.PipSize : 0;
+            Print($"[DEBUG] Close={calcBar.Close:F2} High={calcBar.High:F2} Low={calcBar.Low:F2} DayOpen={_dayOpen:F2} DayLow={_dayLow:F2} DayHigh={_dayHigh:F2} ATR={atrStr} DayMode={_dayMode ?? "none"} SpreadPips={spreadNow:F2} | Direction={direction ?? "none"} ({directionInfo}) | EMAvals: {emaValsStr} | {nearInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedToday={_tradedToday} OpenPosition={(_openPosition != null)}");
         }
 
         // ---------------------------------------------------------------------------------------------
         // EMA trend filter (identical mechanism to the weekly bot)
         // ---------------------------------------------------------------------------------------------
 
+        // Per-timeframe EMA detail (raw fast/slow values and their % separation, not just the long/short
+        // read) - shared by the confluence check and the debug log, so the actual EMA levels are always
+        // available for later analysis (e.g. testing separation strength as a selectivity filter, or
+        // simply eyeballing where the EMAs sat around a given trade) without a second code path to keep
+        // in sync.
+        private List<(string tf, double fast, double slow, string trend)> CollectEmaDetails()
+        {
+            var list = new List<(string tf, double fast, double slow, string trend)>();
+
+            void Add(string tf, ExponentialMovingAverage fastInd, ExponentialMovingAverage slowInd)
+            {
+                if (fastInd == null || slowInd == null) return;
+                double f = fastInd.Result.LastValue;
+                double s = slowInd.Result.LastValue;
+                if (double.IsNaN(f) || double.IsNaN(s)) return;
+                list.Add((tf, f, s, f >= s ? "long" : "short"));
+            }
+
+            Add(EmaTimeFrame1.ToString(), _emaFast1, _emaSlow1);
+            if (UseEmaTimeFrame2) Add(EmaTimeFrame2.ToString(), _emaFast2, _emaSlow2);
+            if (UseEmaTimeFrame3) Add(EmaTimeFrame3.ToString(), _emaFast3, _emaSlow3);
+            if (UseEmaTimeFrame4) Add(EmaTimeFrame4.ToString(), _emaFast4, _emaSlow4);
+            if (UseEmaTimeFrame5) Add(EmaTimeFrame5.ToString(), _emaFast5, _emaSlow5);
+            if (UseEmaTimeFrame6) Add(EmaTimeFrame6.ToString(), _emaFast6, _emaSlow6);
+            if (UseEmaTimeFrame7) Add(EmaTimeFrame7.ToString(), _emaFast7, _emaSlow7);
+
+            return list;
+        }
+
         private (string bias, string reason) GetEmaTrendBias()
         {
             if (!UseEmaTrendFilter) return (null, null);
 
-            var readings = new List<(string tf, string trend)>();
-
-            string t1 = GetSingleEmaTrend(_emaFast1, _emaSlow1);
-            if (t1 != null) readings.Add((EmaTimeFrame1.ToString(), t1));
-
-            if (UseEmaTimeFrame2)
-            {
-                string t2 = GetSingleEmaTrend(_emaFast2, _emaSlow2);
-                if (t2 != null) readings.Add((EmaTimeFrame2.ToString(), t2));
-            }
-
-            if (UseEmaTimeFrame3)
-            {
-                string t3 = GetSingleEmaTrend(_emaFast3, _emaSlow3);
-                if (t3 != null) readings.Add((EmaTimeFrame3.ToString(), t3));
-            }
-
-            if (UseEmaTimeFrame4)
-            {
-                string t4 = GetSingleEmaTrend(_emaFast4, _emaSlow4);
-                if (t4 != null) readings.Add((EmaTimeFrame4.ToString(), t4));
-            }
-
-            if (UseEmaTimeFrame5)
-            {
-                string t5 = GetSingleEmaTrend(_emaFast5, _emaSlow5);
-                if (t5 != null) readings.Add((EmaTimeFrame5.ToString(), t5));
-            }
-
-            if (UseEmaTimeFrame6)
-            {
-                string t6 = GetSingleEmaTrend(_emaFast6, _emaSlow6);
-                if (t6 != null) readings.Add((EmaTimeFrame6.ToString(), t6));
-            }
-
-            if (UseEmaTimeFrame7)
-            {
-                string t7 = GetSingleEmaTrend(_emaFast7, _emaSlow7);
-                if (t7 != null) readings.Add((EmaTimeFrame7.ToString(), t7));
-            }
+            var readings = CollectEmaDetails();
 
             if (readings.Count == 0)
                 return (null, "No EMA readings yet - every enabled timeframe is still NaN (needs EMA Slow Period bars of history on that timeframe to warm up)");
@@ -646,17 +645,6 @@ namespace cAlgo.Robots
                 return ("short", $"EMA confluence {shortCount}/{readings.Count} bearish ({detail})");
 
             return (null, $"No confluence yet: {longCount} long / {shortCount} short of {readings.Count} readings warmed up, need {MinTimeframesAgreeing} to agree ({detail})");
-        }
-
-        private string GetSingleEmaTrend(ExponentialMovingAverage fast, ExponentialMovingAverage slow)
-        {
-            if (fast == null || slow == null) return null;
-
-            double f = fast.Result.LastValue;
-            double s = slow.Result.LastValue;
-            if (double.IsNaN(f) || double.IsNaN(s)) return null;
-
-            return f >= s ? "long" : "short";
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -777,7 +765,11 @@ namespace cAlgo.Robots
             // away from that reference due to spread/slippage - real PnL reconstruction needs the actual
             // fill, not the trigger price.
             double spreadAtEntry = (Symbol.Ask - Symbol.Bid) / Symbol.PipSize;
-            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units | FillPrice={_entryPrice:F2} SpreadPips={spreadAtEntry:F2} Equity={Account.Equity:F2}");
+            // StopLossPrice is the ACTUAL applied stop (read after SetInitialStop already ran), not a
+            // recomputation from StopLossPercent/ATR - removes any doubt about what distance was really
+            // used, especially under Use ATR-Relative Sizing where the distance depends on ATR at that instant.
+            string stopStr = _openPosition.StopLoss.HasValue ? $"{_openPosition.StopLoss.Value:F2}" : "none";
+            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units | FillPrice={_entryPrice:F2} StopLossPrice={stopStr} SpreadPips={spreadAtEntry:F2} Equity={Account.Equity:F2}");
             if (ShowReasons)
                 DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
         }

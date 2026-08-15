@@ -31,10 +31,11 @@
 //   - Entry/exit reasoning labels are proper multi-line ChartText (price, why, which check-time level
 //     triggered it, P&L in price and %) instead of one long concatenated line.
 //   - Use ATR-Relative Sizing (off by default): replaces the fixed-% Stop Loss, TP Increment,
-//     Consolidation Tolerance, and Maximum Daily Swing with ATR-multiple equivalents computed on the
-//     Calculation Timeframe. Chosen as the highest-leverage addition for surviving choppy/trending/
-//     high-volatility regimes without re-tuning, since it touches every trade's risk/reward directly
-//     (tighter in calm conditions, wider in volatile ones) rather than just gating whether trades happen.
+//     Consolidation Tolerance, Maximum Daily Swing, and Daily Open Tolerance with ATR-multiple
+//     equivalents computed on the Calculation Timeframe. Chosen as the highest-leverage addition for
+//     surviving choppy/trending/high-volatility regimes without re-tuning, since it touches every trade's
+//     risk/reward directly (tighter in calm conditions, wider in volatile ones) rather than just gating
+//     whether trades happen.
 //
 // Platform notes (same caveats as the weekly bot):
 //   - The stop loss / breakeven move use a REAL broker-side stop order - accurate, broker-filled.
@@ -132,7 +133,7 @@ namespace cAlgo.Robots
         public TimeFrame CalcTimeFrame { get; set; }
 
         [Parameter("Use ATR-Relative Sizing", DefaultValue = false, Group = "Daily Levels",
-            Description = "Replaces the fixed-% Stop Loss, TP Increment, Consolidation Tolerance, and Maximum Daily Swing with ATR-multiple equivalents below, computed on the Calculation Timeframe. Lets the bot self-adjust to the current volatility regime (tighter in calm conditions, wider in volatile ones) instead of assuming one fixed % forever - the single biggest lever for surviving choppy vs trending vs high-volatility conditions without re-tuning.")]
+            Description = "Replaces the fixed-% Stop Loss, TP Increment, Consolidation Tolerance, Maximum Daily Swing, and Daily Open Tolerance with ATR-multiple equivalents below, computed on the Calculation Timeframe. Lets the bot self-adjust to the current volatility regime (tighter in calm conditions, wider in volatile ones) instead of assuming one fixed % forever - the single biggest lever for surviving choppy vs trending vs high-volatility conditions without re-tuning.")]
         public bool UseAtrSizing { get; set; }
 
         [Parameter("ATR Period", DefaultValue = 14, MinValue = 1, Group = "Daily Levels")]
@@ -204,8 +205,12 @@ namespace cAlgo.Robots
         public double EntryProximityPercent { get; set; }
 
         [Parameter("Daily Open Tolerance %", DefaultValue = 0.0, MinValue = 0, Group = "Strategy",
-            Description = "Acts as a small error/tolerance band around the strict rule: a LONG is allowed anywhere below the day's open, plus up to this % ABOVE it as a margin of error; a SHORT anywhere above the open, plus up to this % BELOW it. 0 = strict (long only below open, short only above).")]
+            Description = "Acts as a small error/tolerance band around the strict rule: a LONG is allowed anywhere below the day's open, plus up to this % ABOVE it as a margin of error; a SHORT anywhere above the open, plus up to this % BELOW it. 0 = strict (long only below open, short only above). Used unless Use ATR-Relative Sizing is on.")]
         public double DailyOpenTolerancePercent { get; set; }
+
+        [Parameter("Daily Open Tolerance (ATR multiple)", DefaultValue = 0.0, MinValue = 0, Group = "Strategy",
+            Description = "Used instead of the % version when Use ATR-Relative Sizing is on. Same error-band behavior, sized in ATR units instead of %.")]
+        public double DailyOpenToleranceAtrMultiple { get; set; }
 
         [Parameter("Risk % Of Equity Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
             Description = "Position size is calculated from this % of current equity and the trade's actual stop-loss distance. Requires Use Stop Loss to be on.")]
@@ -629,11 +634,15 @@ namespace cAlgo.Robots
             string dirReason = UseEmaTrendFilter ? emaReason : $"Daily-swing mode: {_dayMode ?? "none"} (>= {MaxDailySwingPercent}% from open {_dayOpen:F2})";
 
             // Acts as a small error/tolerance band around the strict rule: a LONG is allowed anywhere
-            // below the daily open, plus up to DailyOpenTolerancePercent ABOVE it as a margin of error; a
-            // SHORT anywhere above the open, plus up to that % BELOW it. 0% -> strict (long only below
-            // open, short only above).
-            bool openOkLong = xBar.Close < _dayOpen * (1 + DailyOpenTolerancePercent / 100.0);
-            bool openOkShort = xBar.Close > _dayOpen * (1 - DailyOpenTolerancePercent / 100.0);
+            // below the daily open, plus up to a small margin of error ABOVE it; a SHORT anywhere above
+            // the open, plus up to that same margin BELOW it. 0 -> strict (long only below open, short
+            // only above). The margin switches to an ATR multiple when Use ATR-Relative Sizing is on.
+            bool haveAtrForOpenTol = UseAtrSizing && !double.IsNaN(_currentAtr);
+            double openToleranceAbs = haveAtrForOpenTol
+                ? _currentAtr * DailyOpenToleranceAtrMultiple
+                : _dayOpen * DailyOpenTolerancePercent / 100.0;
+            bool openOkLong = xBar.Close < _dayOpen + openToleranceAbs;
+            bool openOkShort = xBar.Close > _dayOpen - openToleranceAbs;
 
             if (!_tradedToday && _openPosition == null && direction != null)
             {

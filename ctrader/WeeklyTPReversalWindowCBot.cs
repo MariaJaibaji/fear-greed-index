@@ -190,7 +190,8 @@ namespace cAlgo.Robots
             Description = "How close (as a % of price) the exec bar's wick must come to a level to trigger the entry.")]
         public double EntryProximityPercent { get; set; }
 
-        [Parameter("Weekly-Open Tolerance %", DefaultValue = 0.0, MinValue = 0, Group = "Strategy")]
+        [Parameter("Weekly-Open Tolerance %", DefaultValue = 0.0, MinValue = 0, Group = "Strategy",
+            Description = "Maximum distance from the weekly open an entry is still allowed, on the correct side only: a LONG requires price at or below the open, no more than this % below it; a SHORT at or above the open, no more than this % above it. 0 = entry only essentially at the open itself.")]
         public double WeeklyOpenTolerancePercent { get; set; }
 
         [Parameter("Risk % Of Equity Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
@@ -644,8 +645,11 @@ namespace cAlgo.Robots
             }
             bool entryTrigger = UseTPEntry ? nearTP : true;
 
-            bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
-            bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
+            // Maximum distance from the weekly open, on the correct side only - not a grace zone past it.
+            // A LONG requires close at or below open, no more than WeeklyOpenTolerancePercent below it; a
+            // SHORT at or above open, no more than that % above it. 0% -> entry only essentially at open.
+            bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close <= _weekOpen && xBar.Close >= _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
+            bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close >= _weekOpen && xBar.Close <= _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
 
             (string bias, string biasReason) = GetEmaTrendBias();
             bool longAllowed = EnableLongs && (bias == null || bias == "long");

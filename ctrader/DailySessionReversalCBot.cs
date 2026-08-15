@@ -329,57 +329,23 @@ namespace cAlgo.Robots
 
             if (UseEmaTrendFilter)
             {
-                _emaBars1 = MarketData.GetBars(EmaTimeFrame1, SymbolName);
-                _emaFast1 = Indicators.ExponentialMovingAverage(_emaBars1.ClosePrices, EmaFastPeriod);
-                _emaSlow1 = Indicators.ExponentialMovingAverage(_emaBars1.ClosePrices, EmaSlowPeriod);
+                int loadedCount = 0;
+                if (TrySetupEmaSlot(EmaTimeFrame1, out _emaBars1, out _emaFast1, out _emaSlow1)) loadedCount++;
 
-                if (UseEmaTimeFrame2)
-                {
-                    _emaBars2 = MarketData.GetBars(EmaTimeFrame2, SymbolName);
-                    _emaFast2 = Indicators.ExponentialMovingAverage(_emaBars2.ClosePrices, EmaFastPeriod);
-                    _emaSlow2 = Indicators.ExponentialMovingAverage(_emaBars2.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame3)
-                {
-                    _emaBars3 = MarketData.GetBars(EmaTimeFrame3, SymbolName);
-                    _emaFast3 = Indicators.ExponentialMovingAverage(_emaBars3.ClosePrices, EmaFastPeriod);
-                    _emaSlow3 = Indicators.ExponentialMovingAverage(_emaBars3.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame4)
-                {
-                    _emaBars4 = MarketData.GetBars(EmaTimeFrame4, SymbolName);
-                    _emaFast4 = Indicators.ExponentialMovingAverage(_emaBars4.ClosePrices, EmaFastPeriod);
-                    _emaSlow4 = Indicators.ExponentialMovingAverage(_emaBars4.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame5)
-                {
-                    _emaBars5 = MarketData.GetBars(EmaTimeFrame5, SymbolName);
-                    _emaFast5 = Indicators.ExponentialMovingAverage(_emaBars5.ClosePrices, EmaFastPeriod);
-                    _emaSlow5 = Indicators.ExponentialMovingAverage(_emaBars5.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame6)
-                {
-                    _emaBars6 = MarketData.GetBars(EmaTimeFrame6, SymbolName);
-                    _emaFast6 = Indicators.ExponentialMovingAverage(_emaBars6.ClosePrices, EmaFastPeriod);
-                    _emaSlow6 = Indicators.ExponentialMovingAverage(_emaBars6.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame7)
-                {
-                    _emaBars7 = MarketData.GetBars(EmaTimeFrame7, SymbolName);
-                    _emaFast7 = Indicators.ExponentialMovingAverage(_emaBars7.ClosePrices, EmaFastPeriod);
-                    _emaSlow7 = Indicators.ExponentialMovingAverage(_emaBars7.ClosePrices, EmaSlowPeriod);
-                }
+                if (UseEmaTimeFrame2 && TrySetupEmaSlot(EmaTimeFrame2, out _emaBars2, out _emaFast2, out _emaSlow2)) loadedCount++;
+                if (UseEmaTimeFrame3 && TrySetupEmaSlot(EmaTimeFrame3, out _emaBars3, out _emaFast3, out _emaSlow3)) loadedCount++;
+                if (UseEmaTimeFrame4 && TrySetupEmaSlot(EmaTimeFrame4, out _emaBars4, out _emaFast4, out _emaSlow4)) loadedCount++;
+                if (UseEmaTimeFrame5 && TrySetupEmaSlot(EmaTimeFrame5, out _emaBars5, out _emaFast5, out _emaSlow5)) loadedCount++;
+                if (UseEmaTimeFrame6 && TrySetupEmaSlot(EmaTimeFrame6, out _emaBars6, out _emaFast6, out _emaSlow6)) loadedCount++;
+                if (UseEmaTimeFrame7 && TrySetupEmaSlot(EmaTimeFrame7, out _emaBars7, out _emaFast7, out _emaSlow7)) loadedCount++;
 
                 int enabledCount = 1 + (UseEmaTimeFrame2 ? 1 : 0) + (UseEmaTimeFrame3 ? 1 : 0)
                                      + (UseEmaTimeFrame4 ? 1 : 0) + (UseEmaTimeFrame5 ? 1 : 0)
                                      + (UseEmaTimeFrame6 ? 1 : 0) + (UseEmaTimeFrame7 ? 1 : 0);
                 if (MinTimeframesAgreeing > enabledCount)
                     Print($"Warning: Minimum Timeframes Agreeing ({MinTimeframesAgreeing}) is higher than the number of enabled EMA timeframes ({enabledCount}) - the EMA trend filter will never produce a signal.");
+                else if (MinTimeframesAgreeing > loadedCount)
+                    Print($"Warning: only {loadedCount}/{enabledCount} enabled EMA timeframes loaded successfully (see warnings above for which failed), which is below Minimum Timeframes Agreeing ({MinTimeframesAgreeing}) - the EMA trend filter will never produce a signal until that's fixed.");
             }
 
             Positions.Closed += OnPositionsClosed;
@@ -398,6 +364,30 @@ namespace cAlgo.Robots
             if (_calcBars != null) _calcBars.BarOpened -= OnCalcBarOpened;
             if (_execBars != null) _execBars.BarOpened -= OnExecBarOpened;
             Positions.Closed -= OnPositionsClosed;
+        }
+
+        // Loads one EMA timeframe slot defensively: if this timeframe's data fails to load or the
+        // indicator setup throws for any reason, this slot is excluded (bars/fast/slow left null, which
+        // GetSingleEmaTrend already treats as "no reading") instead of taking down the rest of OnStart -
+        // a single unavailable timeframe (e.g. a broker not offering Hour1 bars for a given symbol) must
+        // not silently zero out every timeframe after it in the confluence count.
+        private bool TrySetupEmaSlot(TimeFrame tf, out Bars bars, out ExponentialMovingAverage fast, out ExponentialMovingAverage slow)
+        {
+            try
+            {
+                bars = MarketData.GetBars(tf, SymbolName);
+                fast = Indicators.ExponentialMovingAverage(bars.ClosePrices, EmaFastPeriod);
+                slow = Indicators.ExponentialMovingAverage(bars.ClosePrices, EmaSlowPeriod);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Print($"Warning: EMA Timeframe {tf} failed to load for {SymbolName} ({ex.Message}) - excluding this timeframe from the EMA confluence filter.");
+                bars = null;
+                fast = null;
+                slow = null;
+                return false;
+            }
         }
 
         private void OnExecBarOpened(BarOpenedEventArgs args)

@@ -191,7 +191,7 @@ namespace cAlgo.Robots
         public double EntryProximityPercent { get; set; }
 
         [Parameter("Weekly-Open Tolerance %", DefaultValue = 0.0, MinValue = 0, Group = "Strategy",
-            Description = "Maximum distance from the weekly open an entry is still allowed, on the correct side only: a LONG requires price at or below the open, no more than this % below it; a SHORT at or above the open, no more than this % above it. 0 = entry only essentially at the open itself.")]
+            Description = "Acts as a small error/tolerance band around the strict rule: a LONG is allowed anywhere below the weekly open, plus up to this % ABOVE it as a margin of error; a SHORT anywhere above the open, plus up to this % BELOW it. 0 = strict (long only below open, short only above).")]
         public double WeeklyOpenTolerancePercent { get; set; }
 
         [Parameter("Risk % Of Equity Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
@@ -645,11 +645,12 @@ namespace cAlgo.Robots
             }
             bool entryTrigger = UseTPEntry ? nearTP : true;
 
-            // Maximum distance from the weekly open, on the correct side only - not a grace zone past it.
-            // A LONG requires close at or below open, no more than WeeklyOpenTolerancePercent below it; a
-            // SHORT at or above open, no more than that % above it. 0% -> entry only essentially at open.
-            bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close <= _weekOpen && xBar.Close >= _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
-            bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close >= _weekOpen && xBar.Close <= _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
+            // Acts as a small error/tolerance band around the strict rule: a LONG is allowed anywhere
+            // below the weekly open, plus up to WeeklyOpenTolerancePercent ABOVE it as a margin of error;
+            // a SHORT anywhere above the open, plus up to that % BELOW it. 0% -> strict (long only below
+            // open, short only above).
+            bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
+            bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
 
             (string bias, string biasReason) = GetEmaTrendBias();
             bool longAllowed = EnableLongs && (bias == null || bias == "long");

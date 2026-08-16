@@ -123,15 +123,45 @@ namespace cAlgo.Robots
             Description = "Only strikes within this % of the current underlying price are used in the Gamma Flip calculation - excludes far OTM/ITM strikes, which contribute negligible real gamma but can have unreliable/synthetic-looking quotes (near-zero volume, suspiciously uniform spreads) that would otherwise add noise to the implied-vol inversion.")]
         public double IvStrikeRangePercent { get; set; }
 
+        [Parameter("Skip Trading On Monthly/Weekly Overlap Days", DefaultValue = true, Group = "Gamma Data",
+            Description = "Confirmed real case: the 3rd-Friday monthly expiration date lists a SEPARATE weekly (':w') and monthly (':m') series with meaningfully different, individually thin wall data (one real check: weekly gave 30150/30125, monthly gave a degenerate 29900/29900 - same strike for both walls, a strong sign of insufficient real spread). There's no validated way to reconcile two ambiguous series into one trustworthy level, so the default is to stand down entirely for that night rather than guess. Also triggers on ANY day where the resolved call wall and put wall come back identical (a general low-data-quality signal, not just the monthly-overlap case specifically). Off = use whichever series/expiration the site resolves as default, no special handling (not recommended - untested).")]
+        public bool SkipMonthlyOverlapDays { get; set; }
+
+        [Parameter("Run Weekly Concentration Sweep", DefaultValue = true, Group = "Gamma Data",
+            Description = "Once per calendar day (not every refresh), sweeps every expiration listed for the next Weekly Sweep Max Days and logs Call Wall / Put Wall / Gamma Flip / Concentration Price for each - purely informational, does not affect trading. Concentration Price is the single strike with the largest combined call+put exposure that day (same underlying data Call Wall/Put Wall come from, just looking at both sides together) - logged so you can track whether it tends to line up with that week's eventual high or low, per your hypothesis. Not used in any entry/exit logic yet.")]
+        public bool RunWeeklySweep { get; set; }
+
+        [Parameter("Weekly Sweep Max Days Ahead", DefaultValue = 7, MinValue = 1, MaxValue = 21, Group = "Gamma Data")]
+        public int WeeklySweepMaxDays { get; set; }
+
         [Parameter("Expiration Override (blank = site's default/nearest)", DefaultValue = "", Group = "Gamma Data",
             Description = "Leave blank to let optioncharts.io pick its own default expiration (confirmed it auto-selects the nearest one when this is omitted). Format if you want to pin a specific one: 'YYYY-MM-DD:w', e.g. '2026-08-17:w'.")]
         public string GammaExpirationOverride { get; set; }
 
-        [Parameter("Gamma Refresh (minutes)", DefaultValue = 5, MinValue = 1, Group = "Gamma Data")]
+        [Parameter("Gamma Refresh - Market Open (minutes)", DefaultValue = 5, MinValue = 1, Group = "Gamma Data",
+            Description = "Refresh cadence used OUTSIDE the Market Closed Window below (i.e. while the US options market is actually open and gamma data is live/changing). This is also the underlying Timer tick rate - the Market Closed cadence below is enforced by skipping ticks, not by a separate timer.")]
         public int GammaRefreshMinutes { get; set; }
 
-        [Parameter("Max Gamma Data Age (minutes)", DefaultValue = 30, MinValue = 1, Group = "Gamma Data",
-            Description = "If the feed hasn't been SUCCESSFULLY fetched within this many minutes, treat levels as stale and stand aside - this catches the fetcher/feed silently dying, not the underlying market values being unchanged (those legitimately don't move while the levels are 'locked' between US market close and open).")]
+        [Parameter("Gamma Refresh - Market Closed (minutes)", DefaultValue = 60, MinValue = 1, Group = "Gamma Data",
+            Description = "Slower refresh cadence used INSIDE the Market Closed Window below, since gamma data is frozen/locked while the US options market is shut and there's nothing new to catch by polling every few minutes.")]
+        public int GammaOvernightRefreshMinutes { get; set; }
+
+        [Parameter("Market Closed Window Start Hour", DefaultValue = 21, MinValue = 0, MaxValue = 23, Group = "Gamma Data",
+            Description = "In Session Timezone. Approximate US options market close - governs which of the two refresh cadences above is used, separately from the Overnight Session trading window (which can be tuned independently).")]
+        public int MarketClosedStartHour { get; set; }
+
+        [Parameter("Market Closed Window Start Minute", DefaultValue = 0, MinValue = 0, MaxValue = 59, Group = "Gamma Data")]
+        public int MarketClosedStartMinute { get; set; }
+
+        [Parameter("Market Closed Window End Hour", DefaultValue = 13, MinValue = 0, MaxValue = 23, Group = "Gamma Data",
+            Description = "In Session Timezone. Approximate US options market reopen.")]
+        public int MarketClosedEndHour { get; set; }
+
+        [Parameter("Market Closed Window End Minute", DefaultValue = 25, MinValue = 0, MaxValue = 59, Group = "Gamma Data")]
+        public int MarketClosedEndMinute { get; set; }
+
+        [Parameter("Max Gamma Data Age (minutes)", DefaultValue = 90, MinValue = 1, Group = "Gamma Data",
+            Description = "If the feed hasn't been SUCCESSFULLY fetched within this many minutes, treat levels as stale and stand aside - this catches the fetcher/feed silently dying, not the underlying market values being unchanged. Set comfortably above Gamma Refresh - Market Closed (default 60min) so the slower overnight cadence itself doesn't trip this - default 90 gives a 30min buffer over one missed hourly refresh.")]
         public int MaxGammaDataAgeMinutes { get; set; }
 
         [Parameter("Use EMA Trend Filter", DefaultValue = true, Group = "EMA Trend Filter",
@@ -281,6 +311,9 @@ namespace cAlgo.Robots
         private string _entryRegime; // "positive" or "negative" - the regime the open trade was entered under
         private int _objCounter;
 
+        private bool _standDownForBadGammaData; // monthly/weekly overlap or degenerate (call_wall == put_wall) data
+        private DateTime? _lastSweepDate; // local calendar date (SessionTimeZoneId) the weekly sweep last ran on
+
         // ---------------------------------------------------------------------------------------------
         // Lifecycle
         // ---------------------------------------------------------------------------------------------
@@ -326,6 +359,11 @@ namespace cAlgo.Robots
             Positions.Closed += OnPositionsClosed;
 
             RefreshGammaLevels(); // get an initial read before waiting for the first timer tick
+            if (RunWeeklySweep)
+            {
+                RunWeeklyGammaSweep();
+                _lastSweepDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
+            }
             Timer.Start(TimeSpan.FromMinutes(GammaRefreshMinutes));
         }
 
@@ -337,9 +375,44 @@ namespace cAlgo.Robots
             _http.Dispose();
         }
 
+        // The Timer always ticks at GammaRefreshMinutes (the fast/market-open cadence) - during the Market
+        // Closed Window, most ticks are skipped so the EFFECTIVE cadence slows to GammaOvernightRefreshMinutes,
+        // without needing a second Timer.
         protected override void OnTimer()
         {
-            RefreshGammaLevels();
+            bool marketClosed = IsMarketClosedWindow(Server.TimeInUtc);
+            double minutesSinceLastFetch = _gamma.FetchedUtc == DateTime.MinValue
+                ? double.MaxValue
+                : (Server.TimeInUtc - _gamma.FetchedUtc).TotalMinutes;
+
+            bool dueForRefresh = marketClosed
+                ? minutesSinceLastFetch >= GammaOvernightRefreshMinutes
+                : true; // Timer's own tick rate already IS the market-open cadence
+
+            if (dueForRefresh) RefreshGammaLevels();
+
+            if (RunWeeklySweep)
+            {
+                DateTime localDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
+                if (_lastSweepDate == null || localDate != _lastSweepDate.Value)
+                {
+                    RunWeeklyGammaSweep();
+                    _lastSweepDate = localDate;
+                }
+            }
+        }
+
+        private bool IsMarketClosedWindow(DateTime timeUtc)
+        {
+            DateTime local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(timeUtc, DateTimeKind.Utc), _sessionTz);
+            int nowMinutes = local.Hour * 60 + local.Minute;
+            int startMinutes = MarketClosedStartHour * 60 + MarketClosedStartMinute;
+            int endMinutes = MarketClosedEndHour * 60 + MarketClosedEndMinute;
+
+            // Wraps past midnight (start > end), e.g. 21:00 -> 13:25 next day.
+            return startMinutes > endMinutes
+                ? (nowMinutes >= startMinutes || nowMinutes < endMinutes)
+                : (nowMinutes >= startMinutes && nowMinutes < endMinutes);
         }
 
         private void TrySetupEmaSlot(TimeFrame tf, out Bars bars, out ExponentialMovingAverage fast, out ExponentialMovingAverage slow)
@@ -395,6 +468,13 @@ namespace cAlgo.Robots
                     return;
                 }
 
+                if (SkipMonthlyOverlapDays && IsUnreliableGammaDay(callWall, putWall, expirationId))
+                {
+                    _standDownForBadGammaData = true;
+                    return; // reason already logged by IsUnreliableGammaDay
+                }
+                _standDownForBadGammaData = false;
+
                 string chainHtml = _http.GetStringAsync(BuildOptionChainUrl(expirationId)).Result;
                 var (spot, legs) = ParseOptionChainHtml(chainHtml);
                 if (double.IsNaN(spot) || legs.Count == 0)
@@ -404,7 +484,7 @@ namespace cAlgo.Robots
                 }
 
                 double nowUnix = (Server.TimeInUtc - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
-                double gammaFlip = ComputeGammaFlip(legs, spot, expirationUnix, nowUnix);
+                double gammaFlip = ComputeGammaFlip(legs, spot, expirationUnix, nowUnix, out int contractsUsed);
 
                 var levels = new GammaLevels { CallWall = callWall, PutWall = putWall, GammaFlip = gammaFlip };
                 if (levels.IsValid)
@@ -412,7 +492,7 @@ namespace cAlgo.Robots
                     levels.FetchedUtc = Server.TimeInUtc;
                     _gamma = levels;
                     DrawGammaLines();
-                    Print($"[GAMMA] Refreshed: CallWall={_gamma.CallWall:F2} PutWall={_gamma.PutWall:F2} GammaFlip={_gamma.GammaFlip:F2} (spot={spot:F2}, {legs.Count} contracts used)");
+                    Print($"[GAMMA] Refreshed: CallWall={_gamma.CallWall:F2} PutWall={_gamma.PutWall:F2} GammaFlip={_gamma.GammaFlip:F2} (spot={spot:F2}, {contractsUsed}/{legs.Count} contracts used)");
                 }
                 else
                 {
@@ -423,6 +503,46 @@ namespace cAlgo.Robots
             {
                 Print($"Gamma fetch failed ({ex.Message}) - keeping previous levels until next refresh.");
             }
+        }
+
+        // Detects the two real, confirmed data-quality problems: (1) a degenerate wall read (call wall ==
+        // put wall - a strong sign of insufficient real spread in the data), and (2) today's date having
+        // BOTH a weekly (':w') and monthly (':m') expiration listed, whose wall data was confirmed to
+        // differ meaningfully and both come back individually thin. Either one sets the stand-down flag.
+        private bool IsUnreliableGammaDay(double callWall, double putWall, string expirationId)
+        {
+            if (callWall == putWall)
+            {
+                Print($"[GAMMA] Standing down - Call Wall and Put Wall resolved to the identical strike ({callWall:F2}), a strong sign of insufficient real data spread for '{expirationId}'.");
+                return true;
+            }
+
+            int colonIdx = expirationId.IndexOf(':');
+            if (colonIdx < 0) return false;
+            string datePart = expirationId.Substring(0, colonIdx);
+            string suffix = expirationId.Substring(colonIdx + 1);
+            string otherSuffix = suffix == "w" ? "m" : suffix == "m" ? "w" : null;
+            if (otherSuffix == null) return false; // unrecognized suffix format - don't guess, just proceed normally
+
+            try
+            {
+                string otherId = $"{datePart}:{otherSuffix}";
+                string otherHtml = _http.GetStringAsync(BuildGammaExposureUrl(otherId)).Result;
+                var (otherCallWall, otherPutWall, otherExpirationId, _) = ParseGammaExposureHtml(otherHtml);
+
+                if (!double.IsNaN(otherCallWall) && !double.IsNaN(otherPutWall) && otherExpirationId == otherId)
+                {
+                    Print($"[GAMMA] Standing down - '{expirationId}' AND '{otherId}' both list valid, DIFFERENT wall data for the same date " +
+                          $"({expirationId}: {callWall:F2}/{putWall:F2} vs {otherId}: {otherCallWall:F2}/{otherPutWall:F2}) - no validated way to reconcile two series into one trustworthy level.");
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"[GAMMA] Overlap-day check failed ({ex.Message}) - proceeding without it this refresh.");
+            }
+
+            return false;
         }
 
         private string BuildGammaExposureUrl(string expirationOverride)
@@ -544,8 +664,9 @@ namespace cAlgo.Robots
         // convention observed in optioncharts.io's own call_exposure/put_exposure fields). The flip is
         // the zero-crossing of that curve nearest the current spot - the standard convention when (as is
         // common with real, noisy chain data) more than one crossing exists.
-        private double ComputeGammaFlip(List<ChainLeg> legs, double spot, double expirationUnix, double nowUnix)
+        private double ComputeGammaFlip(List<ChainLeg> legs, double spot, double expirationUnix, double nowUnix, out int contractsUsed)
         {
+            contractsUsed = 0;
             double T = (expirationUnix - nowUnix) / (365.25 * 86400.0);
             if (T <= 0) return double.NaN;
 
@@ -566,6 +687,7 @@ namespace cAlgo.Robots
                 priced.Add((leg.Strike, leg.IsCall, sigma, weight));
             }
 
+            contractsUsed = priced.Count;
             if (priced.Count < 2) return double.NaN;
 
             const int steps = 300;
@@ -609,6 +731,133 @@ namespace cAlgo.Robots
             }
 
             return bestFlip;
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Concentration Price + weekly sweep (informational only - not used in entry/exit logic)
+        // ---------------------------------------------------------------------------------------------
+
+        // The single strike with the largest COMBINED call+put exposure that day - same underlying
+        // per-strike data Call Wall (max call exposure) / Put Wall (max |put exposure|) are each already
+        // the peak of, just considering both sides together instead of separately. Reuses the
+        // gamma_exposure response already fetched for the walls - no extra HTTP call needed.
+        private (double strike, double weight) ComputeConcentrationStrike(string gexHtml)
+        {
+            var strikeMatches = Regex.Matches(gexHtml,
+                "\\{\"strike\":(-?[0-9]+(?:\\.[0-9]+)?),\"call_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"put_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"net_exposure\":(-?[0-9]+(?:\\.[0-9]+)?)\\}");
+
+            double bestStrike = double.NaN;
+            double bestMag = -1;
+            foreach (Match m in strikeMatches)
+            {
+                if (!TryParseInvariant(m.Groups[1].Value, out double strike)) continue;
+                if (!TryParseInvariant(m.Groups[2].Value, out double callExp)) continue;
+                if (!TryParseInvariant(m.Groups[3].Value, out double putExp)) continue;
+
+                double mag = Math.Abs(callExp) + Math.Abs(putExp);
+                if (mag > bestMag)
+                {
+                    bestMag = mag;
+                    bestStrike = strike;
+                }
+            }
+            return (bestStrike, bestMag);
+        }
+
+        // Reads the expiration dropdown off the option chain page (no expiration override, so it lists
+        // everything available) to find what's actually listed for the next N calendar days, rather than
+        // guessing weekday dates - avoids assuming a fixed Mon-Fri cadence that may not hold for every
+        // ticker/period. Returns one entry per listed (date, suffix) pair, so a monthly-overlap date
+        // legitimately produces two entries here.
+        private List<(string expirationId, DateTime date)> DiscoverUpcomingExpirations(int maxDays)
+        {
+            var result = new List<(string expirationId, DateTime date)>();
+            try
+            {
+                string url = $"{OptionChartsBaseUrl.TrimEnd('/')}/async/option_chain?option_type=all&strike_range=all&ticker={Uri.EscapeDataString(GammaTickerSymbol)}";
+                string html = _http.GetStringAsync(url).Result;
+
+                var matches = Regex.Matches(html, "value=\"([0-9]{4}-[0-9]{2}-[0-9]{2}):([a-z])\"");
+                DateTime today = Server.TimeInUtc.Date;
+                DateTime cutoff = today.AddDays(maxDays);
+
+                foreach (Match m in matches)
+                {
+                    if (!DateTime.TryParse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None, out DateTime date)) continue;
+                    if (date < today || date > cutoff) continue;
+                    result.Add(($"{m.Groups[1].Value}:{m.Groups[2].Value}", date));
+                }
+                result.Sort((a, b) => a.date.CompareTo(b.date));
+            }
+            catch (Exception ex)
+            {
+                Print($"[SWEEP] Failed to discover upcoming expirations ({ex.Message}).");
+            }
+            return result;
+        }
+
+        // Runs once per calendar day (triggered from OnTimer - see _lastSweepDate). Purely informational:
+        // logs Call Wall / Put Wall / Gamma Flip / Concentration Price for every expiration listed over the
+        // next Weekly Sweep Max Days, so you can track outcomes against your concentration-price hypothesis
+        // over time. Does not feed into any trading decision.
+        private void RunWeeklyGammaSweep()
+        {
+            var expirations = DiscoverUpcomingExpirations(WeeklySweepMaxDays);
+            if (expirations.Count == 0)
+            {
+                Print("[SWEEP] No upcoming expirations discovered - skipping this sweep.");
+                return;
+            }
+
+            Print($"[SWEEP] === Weekly gamma sweep ({expirations.Count} expiration(s) over the next {WeeklySweepMaxDays} days) ===");
+
+            // Track which calendar dates have more than one listed expiration (the monthly-overlap case),
+            // purely for a clearer log annotation - doesn't change what gets fetched/computed.
+            var dateCounts = new Dictionary<DateTime, int>();
+            foreach (var e in expirations)
+                dateCounts[e.date] = dateCounts.TryGetValue(e.date, out int c) ? c + 1 : 1;
+
+            double nowUnix = (Server.TimeInUtc - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+
+            foreach (var (expirationId, date) in expirations)
+            {
+                try
+                {
+                    string gexHtml = _http.GetStringAsync(BuildGammaExposureUrl(expirationId)).Result;
+                    var (callWall, putWall, resolvedId, expirationUnix) = ParseGammaExposureHtml(gexHtml);
+                    if (double.IsNaN(callWall) || double.IsNaN(putWall))
+                    {
+                        Print($"[SWEEP] {expirationId}: no usable wall data.");
+                        continue;
+                    }
+
+                    var (concStrike, concWeight) = ComputeConcentrationStrike(gexHtml);
+
+                    string chainHtml = _http.GetStringAsync(BuildOptionChainUrl(expirationId)).Result;
+                    var (spot, legs) = ParseOptionChainHtml(chainHtml);
+
+                    string flipStr = "n/a";
+                    string contractsStr = "";
+                    if (!double.IsNaN(spot) && legs.Count > 0)
+                    {
+                        double flip = ComputeGammaFlip(legs, spot, expirationUnix, nowUnix, out int contractsUsed);
+                        flipStr = double.IsNaN(flip) ? "n/a" : flip.ToString("F2");
+                        contractsStr = $", {contractsUsed}/{legs.Count} contracts";
+                    }
+
+                    string overlapNote = dateCounts.TryGetValue(date, out int cnt) && cnt > 1
+                        ? " [MONTHLY/WEEKLY OVERLAP DATE - two series listed, treat both with caution]"
+                        : "";
+                    string degenerateNote = callWall == putWall ? " [DEGENERATE - walls identical, low confidence]" : "";
+
+                    Print($"[SWEEP] {date:yyyy-MM-dd} ({expirationId}): CallWall={callWall:F2} PutWall={putWall:F2} GammaFlip={flipStr} ConcentrationPrice={concStrike:F2}{contractsStr}{overlapNote}{degenerateNote}");
+                }
+                catch (Exception ex)
+                {
+                    Print($"[SWEEP] {expirationId}: fetch/compute failed ({ex.Message}).");
+                }
+            }
         }
 
         private static double NormalCdf(double x)
@@ -761,6 +1010,12 @@ namespace cAlgo.Robots
             {
                 if (_openPosition != null)
                     CloseWithReason("Session end - outside overnight window, forcing flat", xBar.Close, xBar.OpenTime);
+                return;
+            }
+
+            if (_standDownForBadGammaData)
+            {
+                if (EnableDebugLogging) Print("[DEBUG] Standing aside - unreliable gamma data for today (see [GAMMA] log line above for why)");
                 return;
             }
 

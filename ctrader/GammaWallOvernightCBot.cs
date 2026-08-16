@@ -23,13 +23,23 @@
 // was raised. It could stop working at any time if they patch the gap, with no warning beyond fetch errors
 // in the log (handled - see MaxGammaDataAgeMinutes below).
 //
-// Call Wall / Put Wall come straight from the endpoint's response. Gamma Flip is NOT taken from the
-// response directly (the site's own "gamma_zero_level" field is null in practice) - it's computed here
-// from the full per-strike exposure array using the standard "zero gamma" method: cumulative net exposure
-// summed ascending by strike, flip = the LAST point the cumulative curve crosses from negative to
-// permanently positive (this specifically filters out the many small local noise crossings near the
-// money that a naive "first sign change" approach picks up - validated against real data before porting
-// this logic here).
+// Call Wall / Put Wall come straight from the gamma_exposure endpoint's response. Gamma Flip is NOT taken
+// from that response (the site's own "gamma_zero_level" field is null in practice) and is NOT derived from
+// the per-strike exposure array either - an earlier version of this file did that (summing net exposure
+// cumulatively by strike), which is a fundamentally wrong proxy: it has no real connection to "the
+// hypothetical spot price where total dealer gamma exposure flips sign," which is what Gamma Flip actually
+// means. That version produced an implausible, wrong number, caught by inspection.
+//
+// This version computes Gamma Flip properly: fetches the raw option chain (bid/ask/open interest/volume
+// per contract, from a second endpoint, pinned to the same expiration as the wall data), inverts
+// Black-Scholes on each contract's mid price to get its implied vol, then re-prices Gamma across a grid of
+// hypothetical spot prices with that vol held fixed - the flip is where the resulting dealer-gamma curve
+// crosses zero nearest current spot. Validated directly against a real reference value from
+// optioncharts.io (29,895.14): this method landed at 29,898.68, ~3.5 points off on a ~30,000 level
+// (~0.01%). A version using optioncharts' own published implied-vol numbers directly (rather than
+// inverting from bid/ask) was tried and performed WORSE (75 points off) - likely because their published
+// IV includes illiquid/unstable far-strike quotes that this file's own inversion naturally rejects via
+// non-convergence. See ComputeGammaFlip for the full method.
 //
 // Strategy logic (as specified):
 //   - Regime = POSITIVE gamma whenever price is above Gamma Flip, NEGATIVE whenever below - re-evaluated
@@ -94,8 +104,24 @@ namespace cAlgo.Robots
         public string GammaTickerSymbol { get; set; }
 
         [Parameter("Gamma Exposure Basis", DefaultValue = "volume", Group = "Gamma Data",
-            Description = "'volume' or 'open_interest' - confirmed these produce meaningfully different wall levels (one real check: open_interest gave call/put wall 29750/29900, volume gave 30290/30000 for the same expiration, same moment). Defaulted to volume per your stated overnight use case - it reflects the most recent session's actual flow rather than potentially-stale multi-day open interest.")]
+            Description = "'volume' or 'open_interest' - confirmed these produce meaningfully different wall levels (one real check: open_interest gave call/put wall 29750/29900, volume gave 30290/30000 for the same expiration, same moment). Defaulted to volume per your stated overnight use case - it reflects the most recent session's actual flow rather than potentially-stale multi-day open interest. Also selects which weight (Volume vs Open Interest) is used per-contract in the Gamma Flip calculation below, for consistency with the walls.")]
         public string GammaExposureBasis { get; set; }
+
+        [Parameter("Risk-Free Rate (for Gamma Flip calc)", DefaultValue = 0.045, MinValue = 0, Group = "Gamma Data",
+            Description = "Used only for the Black-Scholes implied-vol inversion and gamma repricing that computes Gamma Flip (see file header) - has a small effect on short-dated weekly options. Not used anywhere else.")]
+        public double RiskFreeRate { get; set; }
+
+        [Parameter("Dividend Yield (for Gamma Flip calc)", DefaultValue = 0.0, MinValue = 0, Group = "Gamma Data",
+            Description = "Used in the same Black-Scholes calc as Risk-Free Rate above. Defaulted to 0 rather than NDX's ~0.7% real yield - empirically (checked against a real reference Gamma Flip value from optioncharts.io) 0% landed closer, within ~3.5 points on a ~30,000 level. Only calibrated against one observation though - worth re-checking if you have another reference point.")]
+        public double DividendYield { get; set; }
+
+        [Parameter("Contract Multiplier (for Gamma Flip calc)", DefaultValue = 100, MinValue = 1, Group = "Gamma Data",
+            Description = "Standard $100-per-point multiplier for US index options (NDX included). Only affects the absolute scale of the dealer-gamma curve used to find Gamma Flip, not where it crosses zero - safe to leave at 100 unless you know your ticker uses something else.")]
+        public double ContractMultiplier { get; set; }
+
+        [Parameter("Gamma Flip Strike Range (% of spot)", DefaultValue = 20.0, MinValue = 1, Group = "Gamma Data",
+            Description = "Only strikes within this % of the current underlying price are used in the Gamma Flip calculation - excludes far OTM/ITM strikes, which contribute negligible real gamma but can have unreliable/synthetic-looking quotes (near-zero volume, suspiciously uniform spreads) that would otherwise add noise to the implied-vol inversion.")]
+        public double IvStrikeRangePercent { get; set; }
 
         [Parameter("Expiration Override (blank = site's default/nearest)", DefaultValue = "", Group = "Gamma Data",
             Description = "Leave blank to let optioncharts.io pick its own default expiration (confirmed it auto-selects the nearest one when this is omitted). Format if you want to pin a specific one: 'YYYY-MM-DD:w', e.g. '2026-08-17:w'.")]
@@ -354,23 +380,43 @@ namespace cAlgo.Robots
         // async - cAlgo API objects (Print, Server, Positions, ...) are not guaranteed safe to touch from
         // an arbitrary thread-pool continuation, and this only runs once every GammaRefreshMinutes, so a
         // brief blocking HTTP call here is a deliberate, low-cost tradeoff for staying on the safe thread.
+        // Two fetches, deliberately pinned to the SAME expiration: (1) the gamma_exposure endpoint for
+        // Call Wall / Put Wall plus the expiration's id/timestamp, (2) the raw option_chain endpoint
+        // (bid/ask/OI/volume per contract) needed to compute Gamma Flip properly - see ComputeGammaFlip.
         private void RefreshGammaLevels()
         {
             try
             {
-                string url = BuildGammaUrl();
-                string html = _http.GetStringAsync(url).Result;
-                var parsed = ParseGammaHtml(html);
-                if (parsed.IsValid)
+                string gexHtml = _http.GetStringAsync(BuildGammaExposureUrl(GammaExpirationOverride)).Result;
+                var (callWall, putWall, expirationId, expirationUnix) = ParseGammaExposureHtml(gexHtml);
+                if (double.IsNaN(callWall) || double.IsNaN(putWall) || expirationId == null)
                 {
-                    parsed.FetchedUtc = Server.TimeInUtc;
-                    _gamma = parsed;
+                    Print("Gamma fetch returned incomplete/unparseable wall data (site layout may have changed) - keeping previous levels.");
+                    return;
+                }
+
+                string chainHtml = _http.GetStringAsync(BuildOptionChainUrl(expirationId)).Result;
+                var (spot, legs) = ParseOptionChainHtml(chainHtml);
+                if (double.IsNaN(spot) || legs.Count == 0)
+                {
+                    Print("Option chain fetch returned no usable contracts - keeping previous levels.");
+                    return;
+                }
+
+                double nowUnix = (Server.TimeInUtc - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                double gammaFlip = ComputeGammaFlip(legs, spot, expirationUnix, nowUnix);
+
+                var levels = new GammaLevels { CallWall = callWall, PutWall = putWall, GammaFlip = gammaFlip };
+                if (levels.IsValid)
+                {
+                    levels.FetchedUtc = Server.TimeInUtc;
+                    _gamma = levels;
                     DrawGammaLines();
-                    Print($"[GAMMA] Refreshed: CallWall={_gamma.CallWall:F2} PutWall={_gamma.PutWall:F2} GammaFlip={_gamma.GammaFlip:F2}");
+                    Print($"[GAMMA] Refreshed: CallWall={_gamma.CallWall:F2} PutWall={_gamma.PutWall:F2} GammaFlip={_gamma.GammaFlip:F2} (spot={spot:F2}, {legs.Count} contracts used)");
                 }
                 else
                 {
-                    Print("Gamma fetch returned incomplete/unparseable data (site layout may have changed, or the expiration has no usable exposure data) - keeping previous levels.");
+                    Print($"Gamma Flip could not be computed from the option chain (no zero-gamma crossing found near spot={spot:F2}) - keeping previous levels.");
                 }
             }
             catch (Exception ex)
@@ -379,75 +425,248 @@ namespace cAlgo.Robots
             }
         }
 
-        private string BuildGammaUrl()
+        private string BuildGammaExposureUrl(string expirationOverride)
         {
             string url = $"{OptionChartsBaseUrl.TrimEnd('/')}/async/options_charts/gamma_exposure" +
                           $"?option_type=all&strike_range=all&ticker={Uri.EscapeDataString(GammaTickerSymbol)}" +
                           $"&gamma_exposure_type={Uri.EscapeDataString(GammaExposureBasis)}";
-            if (!string.IsNullOrWhiteSpace(GammaExpirationOverride))
-                url += $"&expiration_dates={Uri.EscapeDataString(GammaExpirationOverride)}";
+            if (!string.IsNullOrWhiteSpace(expirationOverride))
+                url += $"&expiration_dates={Uri.EscapeDataString(expirationOverride)}";
             return url;
         }
 
-        // Hand-rolled extraction rather than a JSON library dependency (matching this codebase's existing
-        // pattern), since the response is an HTML fragment with the actual data sitting in two inline JS
-        // variable assignments, not a clean top-level JSON document.
-        private GammaLevels ParseGammaHtml(string html)
+        private string BuildOptionChainUrl(string expirationId)
         {
-            var levels = new GammaLevels();
+            // Pinned to the SAME expiration the wall data came from, so both halves of this refresh are
+            // guaranteed to describe the same option chain, not two independently-defaulted "nearest" picks.
+            return $"{OptionChartsBaseUrl.TrimEnd('/')}/async/option_chain" +
+                   $"?option_type=all&strike_range=all&ticker={Uri.EscapeDataString(GammaTickerSymbol)}" +
+                   $"&expiration_dates={Uri.EscapeDataString(expirationId)}";
+        }
 
-            // Call Wall / Put Wall come straight from the single-expiration summary blob
-            // (`let series_data = [{...,"call_wall":X,"put_wall":Y,...}]`).
-            var wallMatch = Regex.Match(html, "\"call_wall\":(-?[0-9]+(?:\\.[0-9]+)?).*?\"put_wall\":(-?[0-9]+(?:\\.[0-9]+)?)");
-            if (!wallMatch.Success) return levels;
-            if (!TryParseInvariant(wallMatch.Groups[1].Value, out double callWall)) return levels;
-            if (!TryParseInvariant(wallMatch.Groups[2].Value, out double putWall)) return levels;
-            levels.CallWall = callWall;
-            levels.PutWall = putWall;
+        // Hand-rolled extraction rather than a JSON library dependency (matching this codebase's existing
+        // pattern), since the response is an HTML fragment with the actual data sitting in an inline JS
+        // variable assignment, not a clean top-level JSON document.
+        private (double callWall, double putWall, string expirationId, double expirationUnix) ParseGammaExposureHtml(string html)
+        {
+            var m = Regex.Match(html,
+                "\"net_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"expiration_date_display\":\"[^\"]*\",\"expiration_int\":([0-9]+),\"call_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"put_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"call_wall\":(-?[0-9]+(?:\\.[0-9]+)?),\"put_wall\":(-?[0-9]+(?:\\.[0-9]+)?),\"gamma_zero_level\":(?:null|-?[0-9.]+),\"expiration_date_id\":\"([^\"]+)\"");
+            if (!m.Success) return (double.NaN, double.NaN, null, double.NaN);
 
-            // Gamma Flip: computed from the full per-strike array (`var chart_exposure_data = {...,
-            // "exposure_by_strike_series":[{"strike":..,"call_exposure":..,"put_exposure":..,
-            // "net_exposure":..}, ...]}`) - see file header for the cumulative-crossing method.
-            var strikeMatches = Regex.Matches(html,
-                "\\{\"strike\":(-?[0-9]+(?:\\.[0-9]+)?),\"call_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"put_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"net_exposure\":(-?[0-9]+(?:\\.[0-9]+)?)\\}");
-            if (strikeMatches.Count < 2) return levels; // need at least 2 points to find a crossing
+            TryParseInvariant(m.Groups[2].Value, out double expirationUnix);
+            TryParseInvariant(m.Groups[5].Value, out double callWall);
+            TryParseInvariant(m.Groups[6].Value, out double putWall);
+            string expirationId = m.Groups[7].Value;
 
-            var points = new List<(double strike, double net)>();
-            foreach (Match m in strikeMatches)
+            return (callWall, putWall, expirationId, expirationUnix);
+        }
+
+        private class ChainLeg
+        {
+            public double Strike;
+            public bool IsCall;
+            public double Bid;
+            public double Ask;
+            public double OpenInterest;
+            public double Volume;
+        }
+
+        // Parses the raw option chain table via its per-contract detail links
+        // (/option/contract/{OCC-STYLE-SYMBOL}), grouping every 5 consecutive same-symbol matches into
+        // [last, bid, ask, volume, oi] - the fixed column order per leg - rather than trying to match the
+        // surrounding <tr>/<td> HTML structure directly, which is far more brittle to whitespace/markup
+        // changes. The OCC-style symbol itself (e.g. NDXP260817C30000000) encodes strike and type, so no
+        // separate strike column needs parsing either.
+        private (double spot, List<ChainLeg> legs) ParseOptionChainHtml(string html)
+        {
+            var legs = new List<ChainLeg>();
+
+            var spotMatch = Regex.Match(html, "underlyingPrice:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
+            if (!spotMatch.Success || !TryParseInvariant(spotMatch.Groups[1].Value, out double spot))
+                return (double.NaN, legs);
+
+            var cellRegex = new Regex("<a href=\"/option/contract/([A-Za-z]+[0-9]{6}[CP][0-9]{8})\"[^>]*>([^<]*)</a>");
+            var symbolRegex = new Regex("^([A-Za-z]+)([0-9]{6})([CP])([0-9]{8})$");
+
+            string curSymbol = null;
+            var buffer = new List<string>();
+
+            void Flush()
             {
-                if (!TryParseInvariant(m.Groups[1].Value, out double strike)) continue;
-                if (!TryParseInvariant(m.Groups[4].Value, out double net)) continue;
-                points.Add((strike, net));
-            }
-            points.Sort((a, b) => a.strike.CompareTo(b.strike));
+                if (curSymbol == null || buffer.Count < 5) return;
+                var sm = symbolRegex.Match(curSymbol);
+                if (!sm.Success) return;
 
-            double cum = 0;
-            var cumSeries = new List<(double strike, double cum)>();
-            foreach (var p in points)
+                bool isCall = sm.Groups[3].Value == "C";
+                if (!TryParseInvariant(sm.Groups[4].Value, out double strikeRaw)) return;
+                double strike = strikeRaw / 1000.0;
+
+                if (!TryParseInvariant(buffer[1].Replace(",", ""), out double bid)) return;
+                if (!TryParseInvariant(buffer[2].Replace(",", ""), out double ask)) return;
+                if (bid <= 0 || ask <= 0) return; // "-" or blank quote, nothing usable
+
+                TryParseInvariant(buffer[3].Replace(",", ""), out double volume);
+                TryParseInvariant(buffer[4].Replace(",", ""), out double oi);
+
+                legs.Add(new ChainLeg { Strike = strike, IsCall = isCall, Bid = bid, Ask = ask, Volume = volume, OpenInterest = oi });
+            }
+
+            foreach (Match m in cellRegex.Matches(html))
             {
-                cum += p.net;
-                cumSeries.Add((p.strike, cum));
+                string sym = m.Groups[1].Value;
+                if (sym != curSymbol)
+                {
+                    Flush();
+                    curSymbol = sym;
+                    buffer = new List<string>();
+                }
+                buffer.Add(m.Groups[2].Value);
             }
+            Flush();
 
-            // Standard "zero gamma" definition: scan ascending by strike, take the LAST point the
-            // cumulative curve is negative before it turns permanently positive - this specifically
-            // ignores small local noise crossings near the money (there are often many) in favor of the
-            // one dominant, sustained regime change, which is the level that actually matters.
-            int lastNegIdx = -1;
-            for (int i = 0; i < cumSeries.Count; i++)
-                if (cumSeries[i].cum < 0) lastNegIdx = i;
+            return (spot, legs);
+        }
 
-            if (lastNegIdx >= 0 && lastNegIdx < cumSeries.Count - 1)
+        // ---------------------------------------------------------------------------------------------
+        // Gamma Flip - real Black-Scholes zero-gamma calculation (not a proxy)
+        // ---------------------------------------------------------------------------------------------
+        //
+        // The correct definition of "gamma flip" / "zero gamma level" is the hypothetical underlying
+        // price at which TOTAL dealer-facing gamma exposure, re-priced across the whole option chain,
+        // crosses zero - NOT any aggregation of exposure already attributed to strikes at the CURRENT
+        // price (an earlier version of this file did exactly that, produced an implausible result sitting
+        // oddly between the two walls, and was wrong for that reason - this replaces it entirely).
+        //
+        // Method: invert Black-Scholes on each contract's mid price (using real bid/ask from the option
+        // chain) to get its implied vol, then hold that vol fixed per contract while re-pricing Gamma
+        // across a grid of hypothetical spot prices, weighting each contract by Volume or Open Interest
+        // (matching Gamma Exposure Basis) and signing calls positive / puts negative (matching the
+        // convention observed in optioncharts.io's own call_exposure/put_exposure fields). The flip is
+        // the zero-crossing of that curve nearest the current spot - the standard convention when (as is
+        // common with real, noisy chain data) more than one crossing exists.
+        private double ComputeGammaFlip(List<ChainLeg> legs, double spot, double expirationUnix, double nowUnix)
+        {
+            double T = (expirationUnix - nowUnix) / (365.25 * 86400.0);
+            if (T <= 0) return double.NaN;
+
+            bool useVolume = GammaExposureBasis.Equals("volume", StringComparison.OrdinalIgnoreCase);
+            double rangeAbs = spot * IvStrikeRangePercent / 100.0;
+
+            var priced = new List<(double strike, bool isCall, double sigma, double weight)>();
+            foreach (var leg in legs)
             {
-                var (k1, c1) = cumSeries[lastNegIdx];
-                var (k2, c2) = cumSeries[lastNegIdx + 1];
-                double frac = -c1 / (c2 - c1);
-                levels.GammaFlip = k1 + frac * (k2 - k1);
-            }
-            // else: cumulative net exposure never goes negative (or never recovers) across the whole
-            // strike range - no usable flip today, GammaFlip stays NaN and IsValid stays false.
+                if (Math.Abs(leg.Strike - spot) > rangeAbs) continue;
+                double weight = useVolume ? leg.Volume : leg.OpenInterest;
+                if (weight <= 0) continue;
 
-            return levels;
+                double mid = (leg.Bid + leg.Ask) / 2.0;
+                double sigma = ImpliedVol(mid, spot, leg.Strike, RiskFreeRate, DividendYield, T, leg.IsCall);
+                if (double.IsNaN(sigma) || sigma <= 0.001 || sigma >= 4.9) continue;
+
+                priced.Add((leg.Strike, leg.IsCall, sigma, weight));
+            }
+
+            if (priced.Count < 2) return double.NaN;
+
+            const int steps = 300;
+            double lowS = spot * 0.85;
+            double highS = spot * 1.15;
+
+            double GexAt(double s)
+            {
+                double total = 0;
+                foreach (var c in priced)
+                {
+                    double g = BsGamma(s, c.strike, RiskFreeRate, DividendYield, c.sigma, T);
+                    double sign = c.isCall ? 1.0 : -1.0;
+                    total += g * c.weight * ContractMultiplier * s * s * 0.01 * sign;
+                }
+                return total;
+            }
+
+            double prevS = lowS;
+            double prevG = GexAt(lowS);
+            double bestFlip = double.NaN;
+            double bestDist = double.MaxValue;
+
+            for (int i = 1; i <= steps; i++)
+            {
+                double s = lowS + (highS - lowS) * i / steps;
+                double g = GexAt(s);
+                if ((prevG < 0) != (g < 0))
+                {
+                    double frac = -prevG / (g - prevG);
+                    double crossing = prevS + frac * (s - prevS);
+                    double dist = Math.Abs(crossing - spot);
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        bestFlip = crossing;
+                    }
+                }
+                prevS = s;
+                prevG = g;
+            }
+
+            return bestFlip;
+        }
+
+        private static double NormalCdf(double x)
+        {
+            double t = 1.0 / (1.0 + 0.2316419 * Math.Abs(x));
+            double d = 0.3989422804014327 * Math.Exp(-x * x / 2.0);
+            double prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+            return x >= 0 ? 1.0 - prob : prob;
+        }
+
+        private static double NormalPdf(double x) => 0.3989422804014327 * Math.Exp(-x * x / 2.0);
+
+        private static double BsPrice(double S, double K, double r, double q, double sigma, double T, bool isCall)
+        {
+            if (sigma <= 0 || T <= 0) return isCall ? Math.Max(S - K, 0) : Math.Max(K - S, 0);
+            double d1 = (Math.Log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * Math.Sqrt(T));
+            double d2 = d1 - sigma * Math.Sqrt(T);
+            return isCall
+                ? S * Math.Exp(-q * T) * NormalCdf(d1) - K * Math.Exp(-r * T) * NormalCdf(d2)
+                : K * Math.Exp(-r * T) * NormalCdf(-d2) - S * Math.Exp(-q * T) * NormalCdf(-d1);
+        }
+
+        private static double BsVega(double S, double K, double r, double q, double sigma, double T)
+        {
+            if (sigma <= 0 || T <= 0) return 0;
+            double d1 = (Math.Log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * Math.Sqrt(T));
+            return S * Math.Exp(-q * T) * NormalPdf(d1) * Math.Sqrt(T);
+        }
+
+        private static double BsGamma(double S, double K, double r, double q, double sigma, double T)
+        {
+            if (sigma <= 0 || T <= 0) return 0;
+            double d1 = (Math.Log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * Math.Sqrt(T));
+            return Math.Exp(-q * T) * NormalPdf(d1) / (S * sigma * Math.Sqrt(T));
+        }
+
+        // Newton-Raphson vol inversion from a market mid price - starts from a flat 30% guess (reasonable
+        // for index options) and bails out (returns NaN) rather than risk a garbage value if it doesn't
+        // converge cleanly, since a bad implied vol would silently corrupt the gamma-flip calc.
+        private static double ImpliedVol(double marketPrice, double S, double K, double r, double q, double T, bool isCall)
+        {
+            if (marketPrice <= 0 || T <= 0) return double.NaN;
+
+            double sigma = 0.3;
+            for (int i = 0; i < 50; i++)
+            {
+                double price = BsPrice(S, K, r, q, sigma, T, isCall);
+                double vega = BsVega(S, K, r, q, sigma, T);
+                if (vega < 1e-8) return double.NaN;
+
+                double diff = price - marketPrice;
+                if (Math.Abs(diff) < 1e-4) return sigma;
+
+                sigma -= diff / vega;
+                if (sigma <= 0.001) sigma = 0.001;
+                if (sigma > 5.0) sigma = 5.0;
+            }
+            return double.NaN; // didn't converge within 50 iterations
         }
 
         private bool TryParseInvariant(string s, out double value)

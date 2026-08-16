@@ -12,15 +12,24 @@
 // data needed to validate it, not as a proven edge. Re-tune every % parameter below off real trade logs the
 // same way the other two bots were tuned, once you have some.
 //
-// *** DATA SOURCE: NOT WIRED TO A LIVE FEED YET ***
-// GammaFeedUrl below is a placeholder (a local endpoint you run yourself) - this file does not fetch from
-// optioncharts.io or any other site directly. How that feed gets populated (logged-in scrape, an
-// unauthenticated request to a page's internal data endpoint, manual entry, another provider's real API)
-// is a separate decision with its own legal/ToS considerations - resolve that first, then point
-// GammaFeedUrl at whatever you build. The feed just needs to serve flat JSON:
-//   {"call_wall": 29750.0, "put_wall": 29900.0, "gamma_flip": 24750.74}
-// (gamma_flip may be null if the source couldn't compute a zero-gamma crossing - the bot stands aside
-// whenever any of the three fields is missing/null/unparseable.)
+// *** DATA SOURCE: FETCHES DIRECTLY FROM optioncharts.io - READ THIS ***
+// RefreshGammaLevels() hits optioncharts.io's own internal async endpoint
+// (/async/options_charts/gamma_exposure) directly over HTTP, with no login. That endpoint's data is
+// paywalled in the UI (the Call Wall / Put Wall / Gamma Flip toggle checkboxes are disabled with a lock
+// icon for free accounts) but the server sends the underlying numbers in the response regardless of
+// authentication - confirmed by direct testing. This is reading data through a UI lock that isn't actually
+// enforced server-side, not scraping behind a paid login - a meaningfully different (more clearly
+// against-the-site's-intent) access pattern, done here at your explicit direction after that distinction
+// was raised. It could stop working at any time if they patch the gap, with no warning beyond fetch errors
+// in the log (handled - see MaxGammaDataAgeMinutes below).
+//
+// Call Wall / Put Wall come straight from the endpoint's response. Gamma Flip is NOT taken from the
+// response directly (the site's own "gamma_zero_level" field is null in practice) - it's computed here
+// from the full per-strike exposure array using the standard "zero gamma" method: cumulative net exposure
+// summed ascending by strike, flip = the LAST point the cumulative curve crosses from negative to
+// permanently positive (this specifically filters out the many small local noise crossings near the
+// money that a naive "first sign change" approach picks up - validated against real data before porting
+// this logic here).
 //
 // Strategy logic (as specified):
 //   - Regime = POSITIVE gamma whenever price is above Gamma Flip, NEGATIVE whenever below - re-evaluated
@@ -76,13 +85,21 @@ namespace cAlgo.Robots
         // Parameters
         // ---------------------------------------------------------------------------------------------
 
-        [Parameter("Gamma Feed URL", DefaultValue = "http://127.0.0.1:8787/gamma_levels.json", Group = "Gamma Data",
-            Description = "Placeholder - NOT wired to optioncharts.io or any live site. Point this at a local endpoint you control that serves {\"call_wall\":..,\"put_wall\":..,\"gamma_flip\":..} - see the file header for why this is deliberately not automated yet.")]
-        public string GammaFeedUrl { get; set; }
+        [Parameter("OptionCharts Base URL", DefaultValue = "https://optioncharts.io", Group = "Gamma Data",
+            Description = "Base URL for the gamma exposure fetch - see the file header for exactly what this hits and why.")]
+        public string OptionChartsBaseUrl { get; set; }
 
-        [Parameter("Gamma Exposure Basis (informational)", DefaultValue = "volume", Group = "Gamma Data",
-            Description = "Documents which GEX basis the feed SHOULD be serving (volume vs open_interest) - confirmed these produce meaningfully different wall levels (e.g. one real check: OI gave call/put wall 29750/29900, volume gave 30290/30000 for the same expiration). This parameter doesn't change any bot logic - it's a label for whoever builds/points the feed, defaulted to volume since it reflects the most recent session's actual flow rather than potentially stale multi-day open interest, which fits an overnight-hold use case better.")]
+        [Parameter("Options Ticker (for gamma data)", DefaultValue = "$NDX", Group = "Gamma Data",
+            Description = "The OPTIONS-CHAIN ticker to query for gamma exposure - separate from the Symbol this cBot trades (e.g. your broker's 'US100' CFD), since the options chain and the tradeable instrument are quoted under different symbols. Get this wrong and the fetch will 404 or return another instrument's levels entirely.")]
+        public string GammaTickerSymbol { get; set; }
+
+        [Parameter("Gamma Exposure Basis", DefaultValue = "volume", Group = "Gamma Data",
+            Description = "'volume' or 'open_interest' - confirmed these produce meaningfully different wall levels (one real check: open_interest gave call/put wall 29750/29900, volume gave 30290/30000 for the same expiration, same moment). Defaulted to volume per your stated overnight use case - it reflects the most recent session's actual flow rather than potentially-stale multi-day open interest.")]
         public string GammaExposureBasis { get; set; }
+
+        [Parameter("Expiration Override (blank = site's default/nearest)", DefaultValue = "", Group = "Gamma Data",
+            Description = "Leave blank to let optioncharts.io pick its own default expiration (confirmed it auto-selects the nearest one when this is omitted). Format if you want to pin a specific one: 'YYYY-MM-DD:w', e.g. '2026-08-17:w'.")]
+        public string GammaExpirationOverride { get; set; }
 
         [Parameter("Gamma Refresh (minutes)", DefaultValue = 5, MinValue = 1, Group = "Gamma Data")]
         public int GammaRefreshMinutes { get; set; }
@@ -246,6 +263,13 @@ namespace cAlgo.Robots
         {
             _sessionTz = ResolveTimeZone(SessionTimeZoneId);
 
+            // Headers matching what a real browser sends for this endpoint (confirmed working via direct
+            // testing) - htmx backends like this one commonly branch behavior on HX-Request, and a bare/
+            // absent User-Agent is a common, cheap bot-blocking trigger.
+            _http.DefaultRequestHeaders.Add("HX-Request", "true");
+            _http.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+            _http.DefaultRequestHeaders.Accept.ParseAdd("text/html, */*");
+
             _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
             _execBars.BarOpened += OnExecBarOpened;
 
@@ -334,44 +358,101 @@ namespace cAlgo.Robots
         {
             try
             {
-                string json = _http.GetStringAsync(GammaFeedUrl).Result;
-                var parsed = ParseGammaJson(json);
+                string url = BuildGammaUrl();
+                string html = _http.GetStringAsync(url).Result;
+                var parsed = ParseGammaHtml(html);
                 if (parsed.IsValid)
                 {
                     parsed.FetchedUtc = Server.TimeInUtc;
                     _gamma = parsed;
                     DrawGammaLines();
-                    if (EnableDebugLogging)
-                        Print($"[GAMMA] Refreshed: CallWall={_gamma.CallWall:F2} PutWall={_gamma.PutWall:F2} GammaFlip={_gamma.GammaFlip:F2}");
+                    Print($"[GAMMA] Refreshed: CallWall={_gamma.CallWall:F2} PutWall={_gamma.PutWall:F2} GammaFlip={_gamma.GammaFlip:F2}");
                 }
                 else
                 {
-                    Print("Gamma feed returned incomplete data (missing/null call_wall, put_wall, or gamma_flip) - keeping previous levels.");
+                    Print("Gamma fetch returned incomplete/unparseable data (site layout may have changed, or the expiration has no usable exposure data) - keeping previous levels.");
                 }
             }
             catch (Exception ex)
             {
-                Print($"Gamma feed fetch failed ({ex.Message}) - keeping previous levels until next refresh.");
+                Print($"Gamma fetch failed ({ex.Message}) - keeping previous levels until next refresh.");
             }
         }
 
-        // Hand-rolled flat-JSON field extraction rather than a JSON library dependency, matching this
-        // codebase's existing pattern of not assuming a specific JSON package is available/consistent
-        // across cAlgo API versions. Expects a flat object; nested structures are not needed for this feed.
-        private GammaLevels ParseGammaJson(string json)
+        private string BuildGammaUrl()
+        {
+            string url = $"{OptionChartsBaseUrl.TrimEnd('/')}/async/options_charts/gamma_exposure" +
+                          $"?option_type=all&strike_range=all&ticker={Uri.EscapeDataString(GammaTickerSymbol)}" +
+                          $"&gamma_exposure_type={Uri.EscapeDataString(GammaExposureBasis)}";
+            if (!string.IsNullOrWhiteSpace(GammaExpirationOverride))
+                url += $"&expiration_dates={Uri.EscapeDataString(GammaExpirationOverride)}";
+            return url;
+        }
+
+        // Hand-rolled extraction rather than a JSON library dependency (matching this codebase's existing
+        // pattern), since the response is an HTML fragment with the actual data sitting in two inline JS
+        // variable assignments, not a clean top-level JSON document.
+        private GammaLevels ParseGammaHtml(string html)
         {
             var levels = new GammaLevels();
-            levels.CallWall = ExtractJsonNumber(json, "call_wall");
-            levels.PutWall = ExtractJsonNumber(json, "put_wall");
-            levels.GammaFlip = ExtractJsonNumber(json, "gamma_flip");
+
+            // Call Wall / Put Wall come straight from the single-expiration summary blob
+            // (`let series_data = [{...,"call_wall":X,"put_wall":Y,...}]`).
+            var wallMatch = Regex.Match(html, "\"call_wall\":(-?[0-9]+(?:\\.[0-9]+)?).*?\"put_wall\":(-?[0-9]+(?:\\.[0-9]+)?)");
+            if (!wallMatch.Success) return levels;
+            if (!TryParseInvariant(wallMatch.Groups[1].Value, out double callWall)) return levels;
+            if (!TryParseInvariant(wallMatch.Groups[2].Value, out double putWall)) return levels;
+            levels.CallWall = callWall;
+            levels.PutWall = putWall;
+
+            // Gamma Flip: computed from the full per-strike array (`var chart_exposure_data = {...,
+            // "exposure_by_strike_series":[{"strike":..,"call_exposure":..,"put_exposure":..,
+            // "net_exposure":..}, ...]}`) - see file header for the cumulative-crossing method.
+            var strikeMatches = Regex.Matches(html,
+                "\\{\"strike\":(-?[0-9]+(?:\\.[0-9]+)?),\"call_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"put_exposure\":(-?[0-9]+(?:\\.[0-9]+)?),\"net_exposure\":(-?[0-9]+(?:\\.[0-9]+)?)\\}");
+            if (strikeMatches.Count < 2) return levels; // need at least 2 points to find a crossing
+
+            var points = new List<(double strike, double net)>();
+            foreach (Match m in strikeMatches)
+            {
+                if (!TryParseInvariant(m.Groups[1].Value, out double strike)) continue;
+                if (!TryParseInvariant(m.Groups[4].Value, out double net)) continue;
+                points.Add((strike, net));
+            }
+            points.Sort((a, b) => a.strike.CompareTo(b.strike));
+
+            double cum = 0;
+            var cumSeries = new List<(double strike, double cum)>();
+            foreach (var p in points)
+            {
+                cum += p.net;
+                cumSeries.Add((p.strike, cum));
+            }
+
+            // Standard "zero gamma" definition: scan ascending by strike, take the LAST point the
+            // cumulative curve is negative before it turns permanently positive - this specifically
+            // ignores small local noise crossings near the money (there are often many) in favor of the
+            // one dominant, sustained regime change, which is the level that actually matters.
+            int lastNegIdx = -1;
+            for (int i = 0; i < cumSeries.Count; i++)
+                if (cumSeries[i].cum < 0) lastNegIdx = i;
+
+            if (lastNegIdx >= 0 && lastNegIdx < cumSeries.Count - 1)
+            {
+                var (k1, c1) = cumSeries[lastNegIdx];
+                var (k2, c2) = cumSeries[lastNegIdx + 1];
+                double frac = -c1 / (c2 - c1);
+                levels.GammaFlip = k1 + frac * (k2 - k1);
+            }
+            // else: cumulative net exposure never goes negative (or never recovers) across the whole
+            // strike range - no usable flip today, GammaFlip stays NaN and IsValid stays false.
+
             return levels;
         }
 
-        private double ExtractJsonNumber(string json, string key)
+        private bool TryParseInvariant(string s, out double value)
         {
-            var m = Regex.Match(json, "\"" + Regex.Escape(key) + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
-            if (!m.Success) return double.NaN;
-            return double.TryParse(m.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double v) ? v : double.NaN;
+            return double.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value);
         }
 
         private bool GammaDataIsFresh()

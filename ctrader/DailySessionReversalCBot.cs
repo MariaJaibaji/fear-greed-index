@@ -160,17 +160,27 @@ namespace cAlgo.Robots
             Description = "All check times, the daily open/reset boundary, the breakeven time, and the force-exit time are read in this timezone.")]
         public string SessionTimeZoneId { get; set; }
 
+        [Parameter("Use Check Time 1", DefaultValue = true, Group = "Daily S/R Check Times",
+            Description = "Per-check-time enable/disable, added after real trade data showed entries clustering around one check time's confirmed levels performed very differently from another's (e.g. early-morning-quiet-session confirmations vs an active-hours one).")]
+        public bool UseCheckTime1 { get; set; }
+
         [Parameter("Check Time 1 Hour", DefaultValue = 2, MinValue = 0, MaxValue = 23, Group = "Daily S/R Check Times")]
         public int CheckTime1Hour { get; set; }
 
         [Parameter("Check Time 1 Minute", DefaultValue = 30, MinValue = 0, MaxValue = 59, Group = "Daily S/R Check Times")]
         public int CheckTime1Minute { get; set; }
 
+        [Parameter("Use Check Time 2", DefaultValue = true, Group = "Daily S/R Check Times")]
+        public bool UseCheckTime2 { get; set; }
+
         [Parameter("Check Time 2 Hour", DefaultValue = 8, MinValue = 0, MaxValue = 23, Group = "Daily S/R Check Times")]
         public int CheckTime2Hour { get; set; }
 
         [Parameter("Check Time 2 Minute", DefaultValue = 45, MinValue = 0, MaxValue = 59, Group = "Daily S/R Check Times")]
         public int CheckTime2Minute { get; set; }
+
+        [Parameter("Use Check Time 3", DefaultValue = true, Group = "Daily S/R Check Times")]
+        public bool UseCheckTime3 { get; set; }
 
         [Parameter("Check Time 3 Hour", DefaultValue = 19, MinValue = 0, MaxValue = 23, Group = "Daily S/R Check Times")]
         public int CheckTime3Hour { get; set; }
@@ -510,9 +520,9 @@ namespace cAlgo.Robots
             if (bullSignal && !bearSignal) _dayMode = "up";
             else if (bearSignal && !bullSignal) _dayMode = "down";
 
-            EvaluateCheckTime(1, CheckTime1Hour, CheckTime1Minute, ref _checked1Today, ref _srLevel1, localTime);
-            EvaluateCheckTime(2, CheckTime2Hour, CheckTime2Minute, ref _checked2Today, ref _srLevel2, localTime);
-            EvaluateCheckTime(3, CheckTime3Hour, CheckTime3Minute, ref _checked3Today, ref _srLevel3, localTime);
+            if (UseCheckTime1) EvaluateCheckTime(1, CheckTime1Hour, CheckTime1Minute, ref _checked1Today, ref _srLevel1, localTime);
+            if (UseCheckTime2) EvaluateCheckTime(2, CheckTime2Hour, CheckTime2Minute, ref _checked2Today, ref _srLevel2, localTime);
+            if (UseCheckTime3) EvaluateCheckTime(3, CheckTime3Hour, CheckTime3Minute, ref _checked3Today, ref _srLevel3, localTime);
 
             // Purely visual weekly high/low.
             bool newWeek = IsNewWeek(localTime);

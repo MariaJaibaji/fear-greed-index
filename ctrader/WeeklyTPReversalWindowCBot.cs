@@ -20,6 +20,13 @@
 //     least Minimum Timeframes Agreeing of the enabled timeframes agree on it. Each EMA Timeframe is its
 //     own TimeFrame parameter, and Minimum Timeframes Agreeing is a plain int, so both are directly
 //     optimizable - cTrader's optimizer can sweep which timeframes and how much agreement works best.
+//   - Multi-Symbol Mode - set "Traded Symbols" (comma-separated, e.g. "US100,GER40,EURUSD") to run this
+//     SAME strategy independently across several instruments from one running instance. Each symbol gets
+//     its own weekly high/low/open, EMA readings, window state, and open position - they never share
+//     signal state. They DO share account equity: risk-% sizing is calculated per trade off the live
+//     account equity at the time, so if more than one symbol is in a position simultaneously, the total %
+//     of equity at risk is the sum across them, not capped in aggregate. Leave "Traded Symbols" blank to
+//     keep the original single-symbol behavior (trades only the symbol this cBot is attached to).
 //
 // NOT ported: the Anchored Volume Profile (purely visual, no effect on trading decisions - skipped by
 // request to keep this file focused on the trading logic).
@@ -31,10 +38,16 @@
 //   - "Points" in every input below are RAW PRICE UNITS added to/subtracted from price (matching the Pine
 //     script, which was tuned on an index/crypto-style instrument), NOT pips and NOT Symbol.PipSize
 //     multiples. If your instrument's pip size differs from 1 price unit, re-tune the point-based inputs
-//     or switch to Percent mode.
+//     or switch to Percent mode. In multi-symbol mode, Points-based settings apply the SAME raw value to
+//     every symbol, which rarely makes sense across instruments with different price scales - use Percent
+//     mode (the default) for TP/threshold/stop/trail when trading more than one symbol.
 //   - "New week" is detected by a configurable WeekStartDay (default Monday) transition on the
 //     Calculation Timeframe, since Pine's time("W") week boundary can vary by exchange/instrument. Set it
 //     to match your instrument's actual weekly session start.
+//   - Chart drawing (weekly high/low/open lines, window markers, entry/exit reason labels) only ever
+//     appears for the symbol this cBot is physically attached to - a cBot only has one chart. Other
+//     traded symbols still log every decision via Print() (each line prefixed "[SYMBOL]"), they just don't
+//     draw on this chart.
 //   - This file has not been compiled inside cTrader - the cAlgo API has shifted slightly across versions.
 //     Paste it into cTrader Automate; if the compiler flags a method/property name, it is almost always a
 //     one-line signature fix (e.g. an overload with a slightly different parameter list on your version).
@@ -173,6 +186,10 @@ namespace cAlgo.Robots
             Description = "How many of the ENABLED EMA timeframes must agree on a direction before it's treated as a signal. 7 = strict confluence (all enabled timeframes must agree); lower = majority/partial agreement. If this exceeds the number of enabled timeframes, the filter will never produce a signal.")]
         public int MinTimeframesAgreeing { get; set; }
 
+        [Parameter("Traded Symbols (comma-separated, blank = this chart's symbol only)", DefaultValue = "", Group = "Strategy",
+            Description = "Run this SAME strategy on several instruments from one running instance, e.g. 'US100,GER40,EURUSD'. Each symbol gets fully independent weekly high/low, EMA readings, window state, and position. They share account equity - risk-% sizing is calculated per trade off the live equity at that moment, so if several symbols are in a position at once, total equity at risk is the SUM across them, not capped in aggregate. Leave blank to trade only the symbol this cBot is attached to (identical to the original single-symbol behavior).")]
+        public string TradedSymbols { get; set; }
+
         [Parameter("Trade Longs (bearish-into-window fade)", DefaultValue = true, Group = "Strategy")]
         public bool EnableLongs { get; set; }
 
@@ -195,11 +212,11 @@ namespace cAlgo.Robots
         public double WeeklyOpenTolerancePercent { get; set; }
 
         [Parameter("Risk % Of Equity Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
-            Description = "Position size is calculated from this % of current equity and the trade's actual stop-loss distance, so every trade risks the same amount regardless of how wide the stop is that week. Requires Use Stop Loss to be on.")]
+            Description = "Position size is calculated from this % of current equity and the trade's actual stop-loss distance, so every trade risks the same amount regardless of how wide the stop is that week. Requires Use Stop Loss to be on. In multi-symbol mode this is applied per trade off the SAME shared account equity - it is not divided across symbols.")]
         public double RiskPercent { get; set; }
 
         [Parameter("Max Position Size (lots)", DefaultValue = 5.0, MinValue = 0.01, Group = "Strategy",
-            Description = "Hard safety cap - the risk-% calculation is never allowed to size a position above this, even if the stop is unusually tight or the risk % / equity is mis-set.")]
+            Description = "Hard safety cap - the risk-% calculation is never allowed to size a position above this, even if the stop is unusually tight or the risk % / equity is mis-set. Applied identically to every traded symbol - if your symbols have very different typical lot sizes, this single cap may not be equally appropriate for all of them.")]
         public double MaxVolumeLots { get; set; }
 
         [Parameter("Fallback Volume (lots) If Stop Loss Disabled", DefaultValue = 0.10, MinValue = 0.01, Group = "Strategy",
@@ -252,7 +269,7 @@ namespace cAlgo.Robots
         public bool ShowReasons { get; set; }
 
         [Parameter("Enable Debug Logging", DefaultValue = false, Group = "Strategy",
-            Description = "Prints one diagnostic line per Calculation Timeframe bar: the close's % distance from the weekly high/low, current mode/window direction, EMA confluence state (and why, including counts even with no signal yet), nearest TP/reversal level and its distance vs Entry Proximity %, and the weekly-open tolerance state - use this to see exactly which gate is blocking an entry, or to send the log back for parameter tuning.")]
+            Description = "Prints one diagnostic line per Calculation Timeframe bar per symbol: the close's % distance from the weekly high/low, current mode/window direction, EMA confluence state (and why, including counts even with no signal yet), nearest TP/reversal level and its distance vs Entry Proximity %, and the weekly-open tolerance state - use this to see exactly which gate is blocking an entry, or to send the log back for parameter tuning.")]
         public bool EnableDebugLogging { get; set; }
 
         [Parameter("Force-Exit Hour (window-end day)", DefaultValue = 21, MinValue = 0, MaxValue = 23, Group = "Strategy")]
@@ -262,42 +279,53 @@ namespace cAlgo.Robots
         public int ExitMinute { get; set; }
 
         [Parameter("Lock Execution To A Fixed Timeframe", DefaultValue = true, Group = "Strategy",
-            Description = "On = evaluate entries/exits/window off a fixed timeframe below, so changing the chart timeframe doesn't change results. Off = evaluate on every tick using this chart's own bars.")]
+            Description = "On = evaluate entries/exits/window off a fixed timeframe below, so changing the chart timeframe doesn't change results. Off = evaluate on every tick using this chart's own bars. Only applies in single-symbol mode (Traded Symbols blank) - multi-symbol mode always evaluates each symbol off its own Locked Execution Timeframe bars, since only this chart's own ticks are available to drive an 'unlocked' per-tick evaluation.")]
         public bool LockExecutionTimeframe { get; set; }
 
         [Parameter("Locked Execution Timeframe", DefaultValue = "Minute1", Group = "Strategy")]
         public TimeFrame ExecutionTimeFrame { get; set; }
 
         // ---------------------------------------------------------------------------------------------
-        // State
+        // Per-symbol state
         // ---------------------------------------------------------------------------------------------
 
-        private Bars _calcBars;
-        private Bars _execBars;
-        private Bars _emaBars1, _emaBars2, _emaBars3, _emaBars4, _emaBars5, _emaBars6, _emaBars7;
-        private ExponentialMovingAverage _emaFast1, _emaSlow1;
-        private ExponentialMovingAverage _emaFast2, _emaSlow2;
-        private ExponentialMovingAverage _emaFast3, _emaSlow3;
-        private ExponentialMovingAverage _emaFast4, _emaSlow4;
-        private ExponentialMovingAverage _emaFast5, _emaSlow5;
-        private ExponentialMovingAverage _emaFast6, _emaSlow6;
-        private ExponentialMovingAverage _emaFast7, _emaSlow7;
+        private class SymbolState
+        {
+            public string SymbolName;
+            public Symbol Symbol;
+
+            public Bars CalcBars;
+            public Bars ExecBars;
+            public Action<BarOpenedEventArgs> CalcHandler;
+            public Action<BarOpenedEventArgs> ExecHandler;
+
+            public Bars EmaBars1, EmaBars2, EmaBars3, EmaBars4, EmaBars5, EmaBars6, EmaBars7;
+            public ExponentialMovingAverage EmaFast1, EmaSlow1;
+            public ExponentialMovingAverage EmaFast2, EmaSlow2;
+            public ExponentialMovingAverage EmaFast3, EmaSlow3;
+            public ExponentialMovingAverage EmaFast4, EmaSlow4;
+            public ExponentialMovingAverage EmaFast5, EmaSlow5;
+            public ExponentialMovingAverage EmaFast6, EmaSlow6;
+            public ExponentialMovingAverage EmaFast7, EmaSlow7;
+
+            public DateTime? LastWeekAnchor;
+            public double WeekHigh = double.NaN;
+            public double WeekLow = double.NaN;
+            public double WeekOpen = double.NaN;
+            public string Mode; // "up", "down", or null
+            public double TpStepUp, TpStepDn, ThreshUp, ThreshDn;
+
+            public bool InWarnWindowPrev;
+            public string WarnTrend; // captured direction entering the window
+            public bool TradedWindow;
+
+            public Position OpenPosition;
+            public bool StopTrailed;
+        }
+
+        private readonly Dictionary<string, SymbolState> _states = new Dictionary<string, SymbolState>();
+        private bool _multiSymbolMode;
         private TimeZoneInfo _warnTz;
-
-        private DateTime? _lastWeekAnchor;
-        private double _weekHigh = double.NaN;
-        private double _weekLow = double.NaN;
-        private double _weekOpen = double.NaN;
-        private string _mode; // "up", "down", or null
-        private double _tpStepUp, _tpStepDn, _threshUp, _threshDn;
-
-        private bool _inWarnWindowPrev;
-        private string _warnTrend; // captured direction entering the window
-        private bool _tradedWindow;
-
-        private Position _openPosition;
-        private bool _stopTrailed;
-
         private int _objCounter;
 
         // ---------------------------------------------------------------------------------------------
@@ -308,63 +336,14 @@ namespace cAlgo.Robots
         {
             _warnTz = ResolveTimeZone(WarningTimeZoneId);
 
-            _calcBars = MarketData.GetBars(CalcTimeFrame, SymbolName);
-            _calcBars.BarOpened += OnCalcBarOpened;
+            var symbolNames = ParseSymbolList();
+            _multiSymbolMode = !string.IsNullOrWhiteSpace(TradedSymbols);
 
-            if (LockExecutionTimeframe)
-            {
-                _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
-                _execBars.BarOpened += OnExecBarOpened;
-            }
+            if (_multiSymbolMode && !LockExecutionTimeframe)
+                Print("Note: Traded Symbols is set, so every symbol is evaluated off its own Locked Execution Timeframe bars regardless of the Lock Execution To A Fixed Timeframe setting - that flag only controls single-symbol (blank Traded Symbols) mode, since an 'unlocked' per-tick evaluation only ever has this chart's own ticks to work with.");
 
             if (UseEmaTrendFilter)
             {
-                _emaBars1 = MarketData.GetBars(EmaTimeFrame1, SymbolName);
-                _emaFast1 = Indicators.ExponentialMovingAverage(_emaBars1.ClosePrices, EmaFastPeriod);
-                _emaSlow1 = Indicators.ExponentialMovingAverage(_emaBars1.ClosePrices, EmaSlowPeriod);
-
-                if (UseEmaTimeFrame2)
-                {
-                    _emaBars2 = MarketData.GetBars(EmaTimeFrame2, SymbolName);
-                    _emaFast2 = Indicators.ExponentialMovingAverage(_emaBars2.ClosePrices, EmaFastPeriod);
-                    _emaSlow2 = Indicators.ExponentialMovingAverage(_emaBars2.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame3)
-                {
-                    _emaBars3 = MarketData.GetBars(EmaTimeFrame3, SymbolName);
-                    _emaFast3 = Indicators.ExponentialMovingAverage(_emaBars3.ClosePrices, EmaFastPeriod);
-                    _emaSlow3 = Indicators.ExponentialMovingAverage(_emaBars3.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame4)
-                {
-                    _emaBars4 = MarketData.GetBars(EmaTimeFrame4, SymbolName);
-                    _emaFast4 = Indicators.ExponentialMovingAverage(_emaBars4.ClosePrices, EmaFastPeriod);
-                    _emaSlow4 = Indicators.ExponentialMovingAverage(_emaBars4.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame5)
-                {
-                    _emaBars5 = MarketData.GetBars(EmaTimeFrame5, SymbolName);
-                    _emaFast5 = Indicators.ExponentialMovingAverage(_emaBars5.ClosePrices, EmaFastPeriod);
-                    _emaSlow5 = Indicators.ExponentialMovingAverage(_emaBars5.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame6)
-                {
-                    _emaBars6 = MarketData.GetBars(EmaTimeFrame6, SymbolName);
-                    _emaFast6 = Indicators.ExponentialMovingAverage(_emaBars6.ClosePrices, EmaFastPeriod);
-                    _emaSlow6 = Indicators.ExponentialMovingAverage(_emaBars6.ClosePrices, EmaSlowPeriod);
-                }
-
-                if (UseEmaTimeFrame7)
-                {
-                    _emaBars7 = MarketData.GetBars(EmaTimeFrame7, SymbolName);
-                    _emaFast7 = Indicators.ExponentialMovingAverage(_emaBars7.ClosePrices, EmaFastPeriod);
-                    _emaSlow7 = Indicators.ExponentialMovingAverage(_emaBars7.ClosePrices, EmaSlowPeriod);
-                }
-
                 int enabledCount = 1 + (UseEmaTimeFrame2 ? 1 : 0) + (UseEmaTimeFrame3 ? 1 : 0)
                                      + (UseEmaTimeFrame4 ? 1 : 0) + (UseEmaTimeFrame5 ? 1 : 0)
                                      + (UseEmaTimeFrame6 ? 1 : 0) + (UseEmaTimeFrame7 ? 1 : 0);
@@ -372,35 +351,111 @@ namespace cAlgo.Robots
                     Print($"Warning: Minimum Timeframes Agreeing ({MinTimeframesAgreeing}) is higher than the number of enabled EMA timeframes ({enabledCount}) - the EMA trend filter will never produce a signal.");
             }
 
-            Positions.Closed += OnPositionsClosed;
-
-            // Recover an already-open position if the cBot was restarted mid-trade.
-            _openPosition = Positions.FirstOrDefault(p => p.SymbolName == SymbolName && p.Label == PositionLabel);
-            if (_openPosition != null)
+            foreach (var symName in symbolNames)
             {
-                _tradedWindow = true;
-                Print("Recovered an existing open position on start: " + _openPosition.TradeType);
+                var st = new SymbolState { SymbolName = symName };
+
+                try
+                {
+                    st.Symbol = Symbols.GetSymbol(symName);
+                }
+                catch (Exception ex)
+                {
+                    Print($"Warning: symbol '{symName}' could not be loaded ({ex.Message}) - skipping it entirely.");
+                    continue;
+                }
+
+                st.CalcBars = MarketData.GetBars(CalcTimeFrame, symName);
+                st.CalcHandler = args => OnCalcBarOpened(st, args);
+                st.CalcBars.BarOpened += st.CalcHandler;
+
+                if (LockExecutionTimeframe || _multiSymbolMode)
+                {
+                    st.ExecBars = MarketData.GetBars(ExecutionTimeFrame, symName);
+                    st.ExecHandler = args => OnExecBarOpened(st, args);
+                    st.ExecBars.BarOpened += st.ExecHandler;
+                }
+
+                if (UseEmaTrendFilter) SetupEmaSlots(st);
+
+                st.OpenPosition = Positions.FirstOrDefault(p => p.SymbolName == symName && p.Label == PositionLabel);
+                if (st.OpenPosition != null)
+                {
+                    st.TradedWindow = true;
+                    Print($"[{symName}] Recovered an existing open position on start: {st.OpenPosition.TradeType}");
+                }
+
+                _states[symName] = st;
+            }
+
+            Positions.Closed += OnPositionsClosed;
+        }
+
+        private List<string> ParseSymbolList()
+        {
+            if (string.IsNullOrWhiteSpace(TradedSymbols))
+                return new List<string> { SymbolName };
+
+            return TradedSymbols.Split(',')
+                .Select(s => s.Trim())
+                .Where(s => s.Length > 0)
+                .Distinct()
+                .ToList();
+        }
+
+        private void SetupEmaSlots(SymbolState st)
+        {
+            TrySetupEmaSlot(st, EmaTimeFrame1, out st.EmaBars1, out st.EmaFast1, out st.EmaSlow1);
+            if (UseEmaTimeFrame2) TrySetupEmaSlot(st, EmaTimeFrame2, out st.EmaBars2, out st.EmaFast2, out st.EmaSlow2);
+            if (UseEmaTimeFrame3) TrySetupEmaSlot(st, EmaTimeFrame3, out st.EmaBars3, out st.EmaFast3, out st.EmaSlow3);
+            if (UseEmaTimeFrame4) TrySetupEmaSlot(st, EmaTimeFrame4, out st.EmaBars4, out st.EmaFast4, out st.EmaSlow4);
+            if (UseEmaTimeFrame5) TrySetupEmaSlot(st, EmaTimeFrame5, out st.EmaBars5, out st.EmaFast5, out st.EmaSlow5);
+            if (UseEmaTimeFrame6) TrySetupEmaSlot(st, EmaTimeFrame6, out st.EmaBars6, out st.EmaFast6, out st.EmaSlow6);
+            if (UseEmaTimeFrame7) TrySetupEmaSlot(st, EmaTimeFrame7, out st.EmaBars7, out st.EmaFast7, out st.EmaSlow7);
+        }
+
+        // One failed timeframe (e.g. no history available for that symbol/timeframe combination) only
+        // skips that slot instead of crashing OnStart and silently taking every other symbol down with it.
+        private void TrySetupEmaSlot(SymbolState st, TimeFrame tf, out Bars bars, out ExponentialMovingAverage fast, out ExponentialMovingAverage slow)
+        {
+            bars = null;
+            fast = null;
+            slow = null;
+            try
+            {
+                bars = MarketData.GetBars(tf, st.SymbolName);
+                fast = Indicators.ExponentialMovingAverage(bars.ClosePrices, EmaFastPeriod);
+                slow = Indicators.ExponentialMovingAverage(bars.ClosePrices, EmaSlowPeriod);
+            }
+            catch (Exception ex)
+            {
+                Print($"[{st.SymbolName}] Warning: EMA Timeframe {tf} failed to load ({ex.Message}) - this timeframe slot will be skipped for this symbol.");
             }
         }
 
         protected override void OnBar()
         {
-            if (LockExecutionTimeframe) return; // driven by OnExecBarOpened instead
+            if (_multiSymbolMode) return; // every symbol is driven by OnExecBarOpened instead
+            if (LockExecutionTimeframe) return;
             if (Bars.Count < 2) return;
-            EvaluateTradingLogic(Bars.Last(1));
+            if (_states.TryGetValue(SymbolName, out var st))
+                EvaluateTradingLogic(st, Bars.Last(1));
         }
 
         protected override void OnStop()
         {
-            if (_calcBars != null) _calcBars.BarOpened -= OnCalcBarOpened;
-            if (_execBars != null) _execBars.BarOpened -= OnExecBarOpened;
+            foreach (var st in _states.Values)
+            {
+                if (st.CalcBars != null && st.CalcHandler != null) st.CalcBars.BarOpened -= st.CalcHandler;
+                if (st.ExecBars != null && st.ExecHandler != null) st.ExecBars.BarOpened -= st.ExecHandler;
+            }
             Positions.Closed -= OnPositionsClosed;
         }
 
-        private void OnExecBarOpened(BarOpenedEventArgs args)
+        private void OnExecBarOpened(SymbolState st, BarOpenedEventArgs args)
         {
-            if (_execBars.Count < 2) return;
-            EvaluateTradingLogic(_execBars.Last(1));
+            if (st.ExecBars.Count < 2) return;
+            EvaluateTradingLogic(st, st.ExecBars.Last(1));
         }
 
         private TimeZoneInfo ResolveTimeZone(string id)
@@ -421,71 +476,72 @@ namespace cAlgo.Robots
         // Weekly high/low/open + TP-level tracking (runs on each closed Calculation Timeframe bar)
         // ---------------------------------------------------------------------------------------------
 
-        private void OnCalcBarOpened(BarOpenedEventArgs args)
+        private void OnCalcBarOpened(SymbolState st, BarOpenedEventArgs args)
         {
-            if (_calcBars.Count < 2) return;
-            ProcessCalcBar(_calcBars.Last(1));
+            if (st.CalcBars.Count < 2) return;
+            ProcessCalcBar(st, st.CalcBars.Last(1));
         }
 
-        private bool IsNewWeek(DateTime barOpenTimeUtc)
+        private bool IsNewWeek(SymbolState st, DateTime barOpenTimeUtc)
         {
             DateTime anchor = barOpenTimeUtc.Date;
             while (anchor.DayOfWeek != WeekStartDay) anchor = anchor.AddDays(-1);
 
-            bool isNew = _lastWeekAnchor == null || anchor != _lastWeekAnchor.Value;
-            _lastWeekAnchor = anchor;
+            bool isNew = st.LastWeekAnchor == null || anchor != st.LastWeekAnchor.Value;
+            st.LastWeekAnchor = anchor;
             return isNew;
         }
 
-        private void ProcessCalcBar(Bar bar)
+        private void ProcessCalcBar(SymbolState st, Bar bar)
         {
-            bool newWeek = IsNewWeek(bar.OpenTime);
+            bool newWeek = IsNewWeek(st, bar.OpenTime);
 
-            if (newWeek || double.IsNaN(_weekHigh))
+            if (newWeek || double.IsNaN(st.WeekHigh))
             {
                 // A lingering position across a week boundary is a safety-net close, same as the Pine
                 // script's week-rollover fallback (the force-exit on the window-end day should normally
                 // have already closed it).
-                if (_openPosition != null)
-                    CloseWithReason("Week rollover - safety close", bar.Close, bar.OpenTime);
+                if (st.OpenPosition != null)
+                    CloseWithReason(st, "Week rollover - safety close", bar.Close, bar.OpenTime);
 
-                _weekHigh = bar.High;
-                _weekLow = bar.Low;
-                _weekOpen = bar.Open;
-                _mode = null;
-                _warnTrend = null;
+                st.WeekHigh = bar.High;
+                st.WeekLow = bar.Low;
+                st.WeekOpen = bar.Open;
+                st.Mode = null;
+                st.WarnTrend = null;
             }
             else
             {
-                if (bar.High > _weekHigh) _weekHigh = bar.High;
-                if (bar.Low < _weekLow) _weekLow = bar.Low;
+                if (bar.High > st.WeekHigh) st.WeekHigh = bar.High;
+                if (bar.Low < st.WeekLow) st.WeekLow = bar.Low;
             }
 
             // Effective TP increment / trend threshold - Percent mode is an exact % of the relevant
-            // weekly extreme, so levels stay proportional across a long backtest.
-            _tpStepUp = TpUnit == UnitType.Percent && !double.IsNaN(_weekLow) ? _weekLow * TpStepPercent / 100.0 : TpStepPoints;
-            _tpStepDn = TpUnit == UnitType.Percent && !double.IsNaN(_weekHigh) ? _weekHigh * TpStepPercent / 100.0 : TpStepPoints;
-            _threshUp = TpUnit == UnitType.Percent && !double.IsNaN(_weekLow) ? _weekLow * TrendThresholdPercent / 100.0 : TrendThresholdPoints;
-            _threshDn = TpUnit == UnitType.Percent && !double.IsNaN(_weekHigh) ? _weekHigh * TrendThresholdPercent / 100.0 : TrendThresholdPoints;
+            // weekly extreme, so levels stay proportional across a long backtest (and across symbols with
+            // very different price scales).
+            st.TpStepUp = TpUnit == UnitType.Percent && !double.IsNaN(st.WeekLow) ? st.WeekLow * TpStepPercent / 100.0 : TpStepPoints;
+            st.TpStepDn = TpUnit == UnitType.Percent && !double.IsNaN(st.WeekHigh) ? st.WeekHigh * TpStepPercent / 100.0 : TpStepPoints;
+            st.ThreshUp = TpUnit == UnitType.Percent && !double.IsNaN(st.WeekLow) ? st.WeekLow * TrendThresholdPercent / 100.0 : TrendThresholdPoints;
+            st.ThreshDn = TpUnit == UnitType.Percent && !double.IsNaN(st.WeekHigh) ? st.WeekHigh * TrendThresholdPercent / 100.0 : TrendThresholdPoints;
 
             // Trend / reversal, both sides, always. (Note: the Pine script also tracks a legHigh/legLow +
             // confirmedUp/confirmedDown "TP hit count" here, but that machinery only ever feeds its TP-level
             // chart labels - it has no effect on any entry/exit decision - so it's intentionally left out of
             // this port along with the rest of the skipped visuals.)
-            bool bearSignal = !double.IsNaN(_weekHigh) && !double.IsNaN(_weekLow) && bar.Close <= _weekHigh - _threshDn;
-            bool bullSignal = !double.IsNaN(_weekHigh) && !double.IsNaN(_weekLow) && bar.Close >= _weekLow + _threshUp;
+            bool bearSignal = !double.IsNaN(st.WeekHigh) && !double.IsNaN(st.WeekLow) && bar.Close <= st.WeekHigh - st.ThreshDn;
+            bool bullSignal = !double.IsNaN(st.WeekHigh) && !double.IsNaN(st.WeekLow) && bar.Close >= st.WeekLow + st.ThreshUp;
 
-            if (bullSignal && !bearSignal) _mode = "up";
-            else if (bearSignal && !bullSignal) _mode = "down";
+            if (bullSignal && !bearSignal) st.Mode = "up";
+            else if (bearSignal && !bullSignal) st.Mode = "down";
 
-            if (ShowWeekLines) DrawWeekLines(bar.OpenTime);
+            if (ShowWeekLines && st.SymbolName == SymbolName) DrawWeekLines(bar.OpenTime, st.WeekHigh, st.WeekLow, st.WeekOpen);
 
-            if (EnableDebugLogging) LogDebugState(bar);
+            if (EnableDebugLogging) LogDebugState(st, bar);
         }
 
         // Nearest reversal-threshold / TP-ladder level to refPrice for the given direction, mirroring the
         // same levels EvaluateTradingLogic checks against xBar.Low/xBar.High - used only for diagnostics.
-        private (double level, string desc) NearestReversalLevel(string dir, double refPrice)
+        private (double level, string desc) NearestReversalLevel(SymbolState st, string dir, double refPrice)
         {
             double bestLevel = double.NaN;
             string bestDesc = null;
@@ -505,32 +561,32 @@ namespace cAlgo.Robots
 
             if (dir == "down")
             {
-                if (EntryAtReversal) Consider(_weekHigh - _threshDn, "reversal threshold");
-                for (int i = 1; i <= TpLevelsCount; i++) Consider(_weekHigh - _tpStepDn * i, $"TP{i}");
+                if (EntryAtReversal) Consider(st.WeekHigh - st.ThreshDn, "reversal threshold");
+                for (int i = 1; i <= TpLevelsCount; i++) Consider(st.WeekHigh - st.TpStepDn * i, $"TP{i}");
             }
             else if (dir == "up")
             {
-                if (EntryAtReversal) Consider(_weekLow + _threshUp, "reversal threshold");
-                for (int i = 1; i <= TpLevelsCount; i++) Consider(_weekLow + _tpStepUp * i, $"TP{i}");
+                if (EntryAtReversal) Consider(st.WeekLow + st.ThreshUp, "reversal threshold");
+                for (int i = 1; i <= TpLevelsCount; i++) Consider(st.WeekLow + st.TpStepUp * i, $"TP{i}");
             }
 
             return (bestLevel, bestDesc);
         }
 
-        // One line per Calculation Timeframe bar (opt-in via Enable Debug Logging) showing every AND-ed
-        // entry gate: how far the close sits from the weekly high/low (the reversal setup itself), the
-        // current mode/window direction, EMA confluence state, nearest TP/reversal level and its distance
-        // vs Entry Proximity %, and the weekly-open tolerance check. Send this log back to have parameters
-        // tuned against real gate-by-gate behavior instead of guesswork.
-        private void LogDebugState(Bar bar)
+        // One line per Calculation Timeframe bar per symbol (opt-in via Enable Debug Logging) showing
+        // every AND-ed entry gate: how far the close sits from the weekly high/low (the reversal setup
+        // itself), the current mode/window direction, EMA confluence state, nearest TP/reversal level and
+        // its distance vs Entry Proximity %, and the weekly-open tolerance check. Send this log back to
+        // have parameters tuned against real gate-by-gate behavior instead of guesswork.
+        private void LogDebugState(SymbolState st, Bar bar)
         {
-            double pctFromHigh = !double.IsNaN(_weekHigh) && _weekHigh != 0 ? (_weekHigh - bar.Close) / _weekHigh * 100.0 : double.NaN;
-            double pctFromLow = !double.IsNaN(_weekLow) && _weekLow != 0 ? (bar.Close - _weekLow) / _weekLow * 100.0 : double.NaN;
+            double pctFromHigh = !double.IsNaN(st.WeekHigh) && st.WeekHigh != 0 ? (st.WeekHigh - bar.Close) / st.WeekHigh * 100.0 : double.NaN;
+            double pctFromLow = !double.IsNaN(st.WeekLow) && st.WeekLow != 0 ? (bar.Close - st.WeekLow) / st.WeekLow * 100.0 : double.NaN;
 
             var (inWindow, _, _, _) = GetWindowState(bar.OpenTime);
-            string dir = _warnTrend ?? _mode;
+            string dir = st.WarnTrend ?? st.Mode;
 
-            (string bias, string biasReason) = GetEmaTrendBias();
+            (string bias, string biasReason) = GetEmaTrendBias(st);
 
             string levelInfo;
             if (dir == null)
@@ -543,7 +599,7 @@ namespace cAlgo.Robots
             }
             else
             {
-                (double lvl, string desc) = NearestReversalLevel(dir, bar.Close);
+                (double lvl, string desc) = NearestReversalLevel(st, dir, bar.Close);
                 if (double.IsNaN(lvl))
                 {
                     levelInfo = $"dir={dir}, no valid level (check TP Levels Count / thresholds)";
@@ -556,10 +612,10 @@ namespace cAlgo.Robots
                 }
             }
 
-            bool openOkLong = !double.IsNaN(_weekOpen) && bar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
-            bool openOkShort = !double.IsNaN(_weekOpen) && bar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
+            bool openOkLong = !double.IsNaN(st.WeekOpen) && bar.Close < st.WeekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
+            bool openOkShort = !double.IsNaN(st.WeekOpen) && bar.Close > st.WeekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
 
-            Print($"[DEBUG] Close={bar.Close:F2} WeekOpen={_weekOpen:F2} WeekHigh={_weekHigh:F2} ({pctFromHigh:F3}% below) WeekLow={_weekLow:F2} ({pctFromLow:F3}% above) | Mode={_mode ?? "none"} WindowDir={dir ?? "none"} InWindow={inWindow} | EMA={(bias ?? "none")} ({biasReason ?? "n/a"}) | {levelInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedWindow={_tradedWindow} OpenPosition={(_openPosition != null)}");
+            Print($"[{st.SymbolName}] [DEBUG] Close={bar.Close:F2} WeekOpen={st.WeekOpen:F2} WeekHigh={st.WeekHigh:F2} ({pctFromHigh:F3}% below) WeekLow={st.WeekLow:F2} ({pctFromLow:F3}% above) | Mode={st.Mode ?? "none"} WindowDir={dir ?? "none"} InWindow={inWindow} | EMA={(bias ?? "none")} ({biasReason ?? "n/a"}) | {levelInfo} | OpenOk: long={openOkLong} short={openOkShort} | TradedWindow={st.TradedWindow} OpenPosition={(st.OpenPosition != null)}");
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -593,48 +649,48 @@ namespace cAlgo.Robots
         // Checks EMA Fast vs EMA Slow (same periods) independently on each ENABLED timeframe slot, then
         // requires at least Minimum Timeframes Agreeing of them to agree on a direction before it counts
         // as a signal - so it's a confluence check, not a single-timeframe read.
-        private (string bias, string reason) GetEmaTrendBias()
+        private (string bias, string reason) GetEmaTrendBias(SymbolState st)
         {
             if (!UseEmaTrendFilter) return (null, null);
 
             var readings = new List<(string tf, string trend)>();
 
-            string t1 = GetSingleEmaTrend(_emaFast1, _emaSlow1);
+            string t1 = GetSingleEmaTrend(st.EmaFast1, st.EmaSlow1);
             if (t1 != null) readings.Add((EmaTimeFrame1.ToString(), t1));
 
             if (UseEmaTimeFrame2)
             {
-                string t2 = GetSingleEmaTrend(_emaFast2, _emaSlow2);
+                string t2 = GetSingleEmaTrend(st.EmaFast2, st.EmaSlow2);
                 if (t2 != null) readings.Add((EmaTimeFrame2.ToString(), t2));
             }
 
             if (UseEmaTimeFrame3)
             {
-                string t3 = GetSingleEmaTrend(_emaFast3, _emaSlow3);
+                string t3 = GetSingleEmaTrend(st.EmaFast3, st.EmaSlow3);
                 if (t3 != null) readings.Add((EmaTimeFrame3.ToString(), t3));
             }
 
             if (UseEmaTimeFrame4)
             {
-                string t4 = GetSingleEmaTrend(_emaFast4, _emaSlow4);
+                string t4 = GetSingleEmaTrend(st.EmaFast4, st.EmaSlow4);
                 if (t4 != null) readings.Add((EmaTimeFrame4.ToString(), t4));
             }
 
             if (UseEmaTimeFrame5)
             {
-                string t5 = GetSingleEmaTrend(_emaFast5, _emaSlow5);
+                string t5 = GetSingleEmaTrend(st.EmaFast5, st.EmaSlow5);
                 if (t5 != null) readings.Add((EmaTimeFrame5.ToString(), t5));
             }
 
             if (UseEmaTimeFrame6)
             {
-                string t6 = GetSingleEmaTrend(_emaFast6, _emaSlow6);
+                string t6 = GetSingleEmaTrend(st.EmaFast6, st.EmaSlow6);
                 if (t6 != null) readings.Add((EmaTimeFrame6.ToString(), t6));
             }
 
             if (UseEmaTimeFrame7)
             {
-                string t7 = GetSingleEmaTrend(_emaFast7, _emaSlow7);
+                string t7 = GetSingleEmaTrend(st.EmaFast7, st.EmaSlow7);
                 if (t7 != null) readings.Add((EmaTimeFrame7.ToString(), t7));
             }
 
@@ -665,24 +721,25 @@ namespace cAlgo.Robots
         }
 
         // ---------------------------------------------------------------------------------------------
-        // Entry / exit orchestration (runs once per locked exec bar, or every chart bar when unlocked)
+        // Entry / exit orchestration (runs once per locked exec bar per symbol, or every chart tick for
+        // the chart's own symbol in single-symbol unlocked mode)
         // ---------------------------------------------------------------------------------------------
 
-        private void EvaluateTradingLogic(Bar xBar)
+        private void EvaluateTradingLogic(SymbolState st, Bar xBar)
         {
-            if (double.IsNaN(_weekHigh) || double.IsNaN(_weekLow)) return;
+            if (double.IsNaN(st.WeekHigh) || double.IsNaN(st.WeekLow)) return;
 
             var (inWindow, dow, hour, minute) = GetWindowState(xBar.OpenTime);
 
-            bool windowStart = inWindow && !_inWarnWindowPrev;
+            bool windowStart = inWindow && !st.InWarnWindowPrev;
             if (windowStart)
             {
-                _tradedWindow = false;
-                _warnTrend = _mode;
-                if (ShowWarning) DrawWindowMarkers(xBar.OpenTime, _warnTrend);
+                st.TradedWindow = false;
+                st.WarnTrend = st.Mode;
+                if (ShowWarning && st.SymbolName == SymbolName) DrawWindowMarkers(xBar.OpenTime, st.WarnTrend);
             }
 
-            string dir = _warnTrend ?? _mode;
+            string dir = st.WarnTrend ?? st.Mode;
 
             // Reversal/TP-sweep proximity entry gate - first (shallowest) match wins.
             bool nearTP = false;
@@ -691,20 +748,20 @@ namespace cAlgo.Robots
             {
                 if (EntryAtReversal)
                 {
-                    double rlvl = _weekHigh - _threshDn;
+                    double rlvl = st.WeekHigh - st.ThreshDn;
                     if (rlvl > 0 && Math.Abs(xBar.Low - rlvl) <= rlvl * EntryProximityPercent / 100.0)
                     {
                         nearTP = true;
-                        nearReason = $"reversal threshold ({_threshDn:F0}pt) off weekly high, touched {rlvl:F2}";
+                        nearReason = $"reversal threshold ({st.ThreshDn:F0}pt) off weekly high, touched {rlvl:F2}";
                     }
                 }
                 for (int i = 1; i <= TpLevelsCount && nearReason == null; i++)
                 {
-                    double lvl = _weekHigh - _tpStepDn * i;
+                    double lvl = st.WeekHigh - st.TpStepDn * i;
                     if (lvl > 0 && Math.Abs(xBar.Low - lvl) <= lvl * EntryProximityPercent / 100.0)
                     {
                         nearTP = true;
-                        nearReason = $"TP{i} sweep ({_tpStepDn * i:F0}pt) off weekly high, touched {lvl:F2}";
+                        nearReason = $"TP{i} sweep ({st.TpStepDn * i:F0}pt) off weekly high, touched {lvl:F2}";
                     }
                 }
             }
@@ -712,20 +769,20 @@ namespace cAlgo.Robots
             {
                 if (EntryAtReversal)
                 {
-                    double rlvl = _weekLow + _threshUp;
+                    double rlvl = st.WeekLow + st.ThreshUp;
                     if (rlvl > 0 && Math.Abs(xBar.High - rlvl) <= rlvl * EntryProximityPercent / 100.0)
                     {
                         nearTP = true;
-                        nearReason = $"reversal threshold ({_threshUp:F0}pt) off weekly low, touched {rlvl:F2}";
+                        nearReason = $"reversal threshold ({st.ThreshUp:F0}pt) off weekly low, touched {rlvl:F2}";
                     }
                 }
                 for (int i = 1; i <= TpLevelsCount && nearReason == null; i++)
                 {
-                    double lvl = _weekLow + _tpStepUp * i;
+                    double lvl = st.WeekLow + st.TpStepUp * i;
                     if (lvl > 0 && Math.Abs(xBar.High - lvl) <= lvl * EntryProximityPercent / 100.0)
                     {
                         nearTP = true;
-                        nearReason = $"TP{i} sweep ({_tpStepUp * i:F0}pt) off weekly low, touched {lvl:F2}";
+                        nearReason = $"TP{i} sweep ({st.TpStepUp * i:F0}pt) off weekly low, touched {lvl:F2}";
                     }
                 }
             }
@@ -735,38 +792,38 @@ namespace cAlgo.Robots
             // below the weekly open, plus up to WeeklyOpenTolerancePercent ABOVE it as a margin of error;
             // a SHORT anywhere above the open, plus up to that % BELOW it. 0% -> strict (long only below
             // open, short only above).
-            bool openOkLong = !double.IsNaN(_weekOpen) && xBar.Close < _weekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
-            bool openOkShort = !double.IsNaN(_weekOpen) && xBar.Close > _weekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
+            bool openOkLong = !double.IsNaN(st.WeekOpen) && xBar.Close < st.WeekOpen * (1 + WeeklyOpenTolerancePercent / 100.0);
+            bool openOkShort = !double.IsNaN(st.WeekOpen) && xBar.Close > st.WeekOpen * (1 - WeeklyOpenTolerancePercent / 100.0);
 
-            (string bias, string biasReason) = GetEmaTrendBias();
+            (string bias, string biasReason) = GetEmaTrendBias(st);
             bool longAllowed = EnableLongs && (bias == null || bias == "long");
             bool shortAllowed = EnableShorts && (bias == null || bias == "short");
 
-            if (inWindow && !_tradedWindow && _openPosition == null && dir != null && entryTrigger)
+            if (inWindow && !st.TradedWindow && st.OpenPosition == null && dir != null && entryTrigger)
             {
                 if (dir == "down" && longAllowed && openOkLong)
                 {
                     string reason = "LONG - bearish into window, reversal UP: " +
                                      (UseTPEntry ? nearReason : "window start (no TP-sweep filter)") +
                                      (biasReason != null ? " | " + biasReason : "");
-                    OpenPosition(TradeType.Buy, xBar, reason);
-                    _tradedWindow = true;
+                    OpenPosition(st, TradeType.Buy, xBar, reason);
+                    st.TradedWindow = true;
                 }
                 else if (dir == "up" && shortAllowed && openOkShort)
                 {
                     string reason = "SHORT - bullish into window, reversal DOWN: " +
                                      (UseTPEntry ? nearReason : "window start (no TP-sweep filter)") +
                                      (biasReason != null ? " | " + biasReason : "");
-                    OpenPosition(TradeType.Sell, xBar, reason);
-                    _tradedWindow = true;
+                    OpenPosition(st, TradeType.Sell, xBar, reason);
+                    st.TradedWindow = true;
                 }
                 else if (dir == "down" && !longAllowed && EnableLongs && openOkLong)
                 {
-                    Print($"Entry skipped - LONG signal blocked by EMA trend filter ({biasReason})");
+                    Print($"[{st.SymbolName}] Entry skipped - LONG signal blocked by EMA trend filter ({biasReason})");
                 }
                 else if (dir == "up" && !shortAllowed && EnableShorts && openOkShort)
                 {
-                    Print($"Entry skipped - SHORT signal blocked by EMA trend filter ({biasReason})");
+                    Print($"[{st.SymbolName}] Entry skipped - SHORT signal blocked by EMA trend filter ({biasReason})");
                 }
             }
 
@@ -774,134 +831,134 @@ namespace cAlgo.Robots
             bool afterWindowEnd = dow == WarnEndDay && (hour > WarnEndHour || (hour == WarnEndHour && minute >= WarnEndMinute));
             bool forceExit = dow == WarnEndDay && (hour > ExitHour || (hour == ExitHour && minute >= ExitMinute));
 
-            UpdateTrailingStop(xBar, dow, hour, minute);
-            CheckTakeProfit(xBar);
+            UpdateTrailingStop(st, xBar, dow, hour, minute);
+            CheckTakeProfit(st, xBar);
 
-            if (_openPosition != null && afterWindowEnd)
+            if (st.OpenPosition != null && afterWindowEnd)
             {
-                if (_openPosition.TradeType == TradeType.Buy && _mode == "down")
-                    CloseWithReason("LONG exit - trend flipped DOWN (up-TP became resistance)", xBar.Close, xBar.OpenTime);
-                else if (_openPosition.TradeType == TradeType.Sell && _mode == "up")
-                    CloseWithReason("SHORT exit - trend flipped UP (down-TP became support)", xBar.Close, xBar.OpenTime);
+                if (st.OpenPosition.TradeType == TradeType.Buy && st.Mode == "down")
+                    CloseWithReason(st, "LONG exit - trend flipped DOWN (up-TP became resistance)", xBar.Close, xBar.OpenTime);
+                else if (st.OpenPosition.TradeType == TradeType.Sell && st.Mode == "up")
+                    CloseWithReason(st, "SHORT exit - trend flipped UP (down-TP became support)", xBar.Close, xBar.OpenTime);
             }
 
-            if (_openPosition != null && forceExit)
-                CloseWithReason("Force exit - window-end time reached, no weekend hold", xBar.Close, xBar.OpenTime);
+            if (st.OpenPosition != null && forceExit)
+                CloseWithReason(st, "Force exit - window-end time reached, no weekend hold", xBar.Close, xBar.OpenTime);
 
-            _inWarnWindowPrev = inWindow;
+            st.InWarnWindowPrev = inWindow;
         }
 
         // ---------------------------------------------------------------------------------------------
         // Position management
         // ---------------------------------------------------------------------------------------------
 
-        private void OpenPosition(TradeType type, Bar xBar, string reason)
+        private void OpenPosition(SymbolState st, TradeType type, Bar xBar, string reason)
         {
             // Volume must be decided BEFORE the order goes out, so the stop distance is estimated off the
             // current market price (Ask for a buy, Bid for a sell). The real entry may differ slightly by
             // spread/slippage - the stop itself is set from the actual fill price right after, in
             // SetInitialStop(), so only the SIZE (not the stop level) relies on this estimate.
-            double estEntry = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
+            double estEntry = type == TradeType.Buy ? st.Symbol.Ask : st.Symbol.Bid;
             double estStopDist = UseStopLoss
                 ? (StopUnit == UnitType.Percent ? estEntry * StopLossPercent / 100.0 : StopLossPoints)
                 : 0;
 
             double volumeInUnits = UseStopLoss && estStopDist > 0
-                ? CalculateVolume(estStopDist)
-                : Symbol.NormalizeVolumeInUnits(Symbol.QuantityToVolumeInUnits(FallbackVolumeLots));
+                ? CalculateVolume(st, estStopDist)
+                : st.Symbol.NormalizeVolumeInUnits(st.Symbol.QuantityToVolumeInUnits(FallbackVolumeLots));
 
-            var result = ExecuteMarketOrder(type, SymbolName, volumeInUnits, PositionLabel, null, null, reason);
+            var result = ExecuteMarketOrder(type, st.SymbolName, volumeInUnits, PositionLabel, null, null, reason);
 
             if (!result.IsSuccessful || result.Position == null)
             {
-                Print("Entry failed: " + result.Error);
+                Print($"[{st.SymbolName}] Entry failed: " + result.Error);
                 return;
             }
 
-            _openPosition = result.Position;
-            _stopTrailed = false;
-            SetInitialStop();
+            st.OpenPosition = result.Position;
+            st.StopTrailed = false;
+            SetInitialStop(st);
 
-            Print(reason + $" | Volume: {volumeInUnits} units");
-            if (ShowReasons)
+            Print($"[{st.SymbolName}] " + reason + $" | Volume: {volumeInUnits} units");
+            if (ShowReasons && st.SymbolName == SymbolName)
                 DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
         }
 
         // Sizes the position so that a stop-loss hit at `stopDistance` away from entry loses RiskPercent%
         // of current equity, capped at MaxVolumeLots as a hard safety backstop.
-        private double CalculateVolume(double stopDistance)
+        private double CalculateVolume(SymbolState st, double stopDistance)
         {
-            if (stopDistance <= 0) return Symbol.VolumeInUnitsMin;
+            if (stopDistance <= 0) return st.Symbol.VolumeInUnitsMin;
 
             double riskAmount = Account.Equity * RiskPercent / 100.0;
 
-            double pips = stopDistance / Symbol.PipSize;
-            double riskPerLot = pips * Symbol.PipValue;
-            if (riskPerLot <= 0) return Symbol.VolumeInUnitsMin;
+            double pips = stopDistance / st.Symbol.PipSize;
+            double riskPerLot = pips * st.Symbol.PipValue;
+            if (riskPerLot <= 0) return st.Symbol.VolumeInUnitsMin;
 
             double lots = riskAmount / riskPerLot;
-            double volumeInUnits = lots * Symbol.LotSize;
+            double volumeInUnits = lots * st.Symbol.LotSize;
 
-            double maxUnits = Symbol.QuantityToVolumeInUnits(MaxVolumeLots);
+            double maxUnits = st.Symbol.QuantityToVolumeInUnits(MaxVolumeLots);
             volumeInUnits = Math.Min(volumeInUnits, maxUnits);
 
-            volumeInUnits = Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down);
-            if (volumeInUnits < Symbol.VolumeInUnitsMin) volumeInUnits = Symbol.VolumeInUnitsMin;
+            volumeInUnits = st.Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down);
+            if (volumeInUnits < st.Symbol.VolumeInUnitsMin) volumeInUnits = st.Symbol.VolumeInUnitsMin;
 
             return volumeInUnits;
         }
 
-        private void SetInitialStop()
+        private void SetInitialStop(SymbolState st)
         {
-            if (!UseStopLoss || _openPosition == null) return;
+            if (!UseStopLoss || st.OpenPosition == null) return;
 
-            double entry = _openPosition.EntryPrice;
+            double entry = st.OpenPosition.EntryPrice;
             double dist = StopUnit == UnitType.Percent ? entry * StopLossPercent / 100.0 : StopLossPoints;
-            double level = _openPosition.TradeType == TradeType.Buy ? entry - dist : entry + dist;
-            _openPosition.ModifyStopLossPrice(level);
+            double level = st.OpenPosition.TradeType == TradeType.Buy ? entry - dist : entry + dist;
+            st.OpenPosition.ModifyStopLossPrice(level);
         }
 
-        private void UpdateTrailingStop(Bar xBar, DayOfWeek dow, int hour, int minute)
+        private void UpdateTrailingStop(SymbolState st, Bar xBar, DayOfWeek dow, int hour, int minute)
         {
-            if (_openPosition == null || !UseStopLoss || !UseTrailStop) return;
+            if (st.OpenPosition == null || !UseStopLoss || !UseTrailStop) return;
 
             int trailIdx = (int)TrailDay;
             int curIdx = (int)dow;
             bool pastTrailTime = curIdx > trailIdx || (curIdx == trailIdx && (hour > TrailHour || (hour == TrailHour && minute >= TrailMinute)));
             if (!pastTrailTime) return;
 
-            double trailStepUp = TrailStepUnit == UnitType.Percent && !double.IsNaN(_weekLow) ? _weekLow * TrailStepPercent / 100.0 : TrailStepPoints;
-            double trailStepDn = TrailStepUnit == UnitType.Percent && !double.IsNaN(_weekHigh) ? _weekHigh * TrailStepPercent / 100.0 : TrailStepPoints;
+            double trailStepUp = TrailStepUnit == UnitType.Percent && !double.IsNaN(st.WeekLow) ? st.WeekLow * TrailStepPercent / 100.0 : TrailStepPoints;
+            double trailStepDn = TrailStepUnit == UnitType.Percent && !double.IsNaN(st.WeekHigh) ? st.WeekHigh * TrailStepPercent / 100.0 : TrailStepPoints;
 
-            double? currentSL = _openPosition.StopLoss;
+            double? currentSL = st.OpenPosition.StopLoss;
 
-            if (_openPosition.TradeType == TradeType.Buy)
+            if (st.OpenPosition.TradeType == TradeType.Buy)
             {
                 // "Smart" confirmation: requires the CLOSE, not just a wick, to have travelled that many
                 // steps past the weekly low - mirrors the close-based reversal-threshold logic above. No
                 // breakeven jump: until at least one step is confirmed, the stop is left alone.
-                int steps = trailStepUp > 0 ? (int)Math.Floor(Math.Max(xBar.Close - _weekLow, 0) / trailStepUp) : 0;
+                int steps = trailStepUp > 0 ? (int)Math.Floor(Math.Max(xBar.Close - st.WeekLow, 0) / trailStepUp) : 0;
                 if (steps <= 0) return;
 
-                double target = _weekLow + trailStepUp * steps;
+                double target = st.WeekLow + trailStepUp * steps;
                 if (currentSL == null || target > currentSL.Value)
                 {
-                    _openPosition.ModifyStopLossPrice(target);
-                    _stopTrailed = true;
-                    if (ShowReasons) DrawTrailMarker(xBar, target);
+                    st.OpenPosition.ModifyStopLossPrice(target);
+                    st.StopTrailed = true;
+                    if (ShowReasons && st.SymbolName == SymbolName) DrawTrailMarker(xBar, target);
                 }
             }
             else
             {
-                int steps = trailStepDn > 0 ? (int)Math.Floor(Math.Max(_weekHigh - xBar.Close, 0) / trailStepDn) : 0;
+                int steps = trailStepDn > 0 ? (int)Math.Floor(Math.Max(st.WeekHigh - xBar.Close, 0) / trailStepDn) : 0;
                 if (steps <= 0) return;
 
-                double target = _weekHigh - trailStepDn * steps;
+                double target = st.WeekHigh - trailStepDn * steps;
                 if (currentSL == null || target < currentSL.Value)
                 {
-                    _openPosition.ModifyStopLossPrice(target);
-                    _stopTrailed = true;
-                    if (ShowReasons) DrawTrailMarker(xBar, target);
+                    st.OpenPosition.ModifyStopLossPrice(target);
+                    st.StopTrailed = true;
+                    if (ShowReasons && st.SymbolName == SymbolName) DrawTrailMarker(xBar, target);
                 }
             }
         }
@@ -911,66 +968,67 @@ namespace cAlgo.Robots
         // TakeProfitLevels increments past the weekly extreme (i.e. that level has effectively become
         // support/resistance), reusing the same TP Increment step as the main TP ladder. Always active
         // once in a trade (not gated to the window-end, unlike the TP-flip exit below).
-        private void CheckTakeProfit(Bar xBar)
+        private void CheckTakeProfit(SymbolState st, Bar xBar)
         {
-            if (_openPosition == null || !UseTakeProfit) return;
+            if (st.OpenPosition == null || !UseTakeProfit) return;
 
-            if (_openPosition.TradeType == TradeType.Buy)
+            if (st.OpenPosition.TradeType == TradeType.Buy)
             {
-                int steps = _tpStepUp > 0 ? (int)Math.Floor(Math.Max(xBar.Close - _weekLow, 0) / _tpStepUp) : 0;
+                int steps = st.TpStepUp > 0 ? (int)Math.Floor(Math.Max(xBar.Close - st.WeekLow, 0) / st.TpStepUp) : 0;
                 if (steps >= TakeProfitLevels)
                 {
-                    double level = _weekLow + _tpStepUp * TakeProfitLevels;
-                    CloseWithReason($"Take profit - TP{TakeProfitLevels} confirmed by close (support formed @ {level:F2})", xBar.Close, xBar.OpenTime);
+                    double level = st.WeekLow + st.TpStepUp * TakeProfitLevels;
+                    CloseWithReason(st, $"Take profit - TP{TakeProfitLevels} confirmed by close (support formed @ {level:F2})", xBar.Close, xBar.OpenTime);
                 }
             }
             else
             {
-                int steps = _tpStepDn > 0 ? (int)Math.Floor(Math.Max(_weekHigh - xBar.Close, 0) / _tpStepDn) : 0;
+                int steps = st.TpStepDn > 0 ? (int)Math.Floor(Math.Max(st.WeekHigh - xBar.Close, 0) / st.TpStepDn) : 0;
                 if (steps >= TakeProfitLevels)
                 {
-                    double level = _weekHigh - _tpStepDn * TakeProfitLevels;
-                    CloseWithReason($"Take profit - TP{TakeProfitLevels} confirmed by close (resistance formed @ {level:F2})", xBar.Close, xBar.OpenTime);
+                    double level = st.WeekHigh - st.TpStepDn * TakeProfitLevels;
+                    CloseWithReason(st, $"Take profit - TP{TakeProfitLevels} confirmed by close (resistance formed @ {level:F2})", xBar.Close, xBar.OpenTime);
                 }
             }
         }
 
-        private void CloseWithReason(string reason, double price, DateTime time)
+        private void CloseWithReason(SymbolState st, string reason, double price, DateTime time)
         {
-            if (_openPosition == null) return;
+            if (st.OpenPosition == null) return;
 
-            Print(reason);
-            if (ShowReasons)
-                DrawReasonLabel(reason, time, price, _openPosition.TradeType != TradeType.Buy, Color.Orange);
+            Print($"[{st.SymbolName}] " + reason);
+            if (ShowReasons && st.SymbolName == SymbolName)
+                DrawReasonLabel(reason, time, price, st.OpenPosition.TradeType != TradeType.Buy, Color.Orange);
 
-            ClosePosition(_openPosition);
-            _openPosition = null;
-            _stopTrailed = false;
+            ClosePosition(st.OpenPosition);
+            st.OpenPosition = null;
+            st.StopTrailed = false;
         }
 
         // Catches broker-triggered stop-loss fills (we didn't call ClosePosition ourselves for those).
         private void OnPositionsClosed(PositionClosedEventArgs args)
         {
-            if (args.Position.Label != PositionLabel || args.Position.SymbolName != SymbolName) return;
+            if (args.Position.Label != PositionLabel) return;
+            if (!_states.TryGetValue(args.Position.SymbolName, out var st)) return;
             if (args.Reason != PositionCloseReason.StopLoss) return; // manual closes are already logged at the call site
 
-            string reason = _stopTrailed
+            string reason = st.StopTrailed
                 ? $"Trailing stop hit @ {args.Position.StopLoss:F2} (locked-in profit)"
                 : $"Stop loss hit @ {args.Position.StopLoss:F2}";
 
-            Print(reason);
-            if (ShowReasons)
+            Print($"[{st.SymbolName}] " + reason);
+            if (ShowReasons && st.SymbolName == SymbolName)
                 DrawReasonLabel(reason, Server.TimeInUtc, args.Position.StopLoss ?? 0, args.Position.TradeType != TradeType.Buy, Color.Red);
 
-            if (_openPosition != null && _openPosition.Id == args.Position.Id)
+            if (st.OpenPosition != null && st.OpenPosition.Id == args.Position.Id)
             {
-                _openPosition = null;
-                _stopTrailed = false;
+                st.OpenPosition = null;
+                st.StopTrailed = false;
             }
         }
 
         // ---------------------------------------------------------------------------------------------
-        // Chart drawing
+        // Chart drawing (only ever called for the symbol this cBot is attached to - see call-site gates)
         // ---------------------------------------------------------------------------------------------
 
         private void DrawReasonLabel(string text, DateTime time, double price, bool above, Color color)
@@ -1007,16 +1065,16 @@ namespace cAlgo.Robots
             Chart.DrawVerticalLine("WarnEnd", endUtc, c, 1, LineStyle.Dots);
         }
 
-        private void DrawWeekLines(DateTime weekBarTime)
+        private void DrawWeekLines(DateTime weekBarTime, double weekHigh, double weekLow, double weekOpen)
         {
             Chart.RemoveObject("WeekHigh");
             Chart.RemoveObject("WeekLow");
             Chart.RemoveObject("WeekOpen");
 
             var endTime = weekBarTime.AddDays(7);
-            Chart.DrawTrendLine("WeekHigh", weekBarTime, _weekHigh, endTime, _weekHigh, Color.Green, 2);
-            Chart.DrawTrendLine("WeekLow", weekBarTime, _weekLow, endTime, _weekLow, Color.Red, 2);
-            Chart.DrawTrendLine("WeekOpen", weekBarTime, _weekOpen, endTime, _weekOpen, Color.Yellow, 2);
+            Chart.DrawTrendLine("WeekHigh", weekBarTime, weekHigh, endTime, weekHigh, Color.Green, 2);
+            Chart.DrawTrendLine("WeekLow", weekBarTime, weekLow, endTime, weekLow, Color.Red, 2);
+            Chart.DrawTrendLine("WeekOpen", weekBarTime, weekOpen, endTime, weekOpen, Color.Yellow, 2);
         }
     }
 }

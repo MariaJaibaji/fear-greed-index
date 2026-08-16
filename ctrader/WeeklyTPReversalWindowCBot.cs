@@ -10,8 +10,10 @@
 // position's comment and drawn on the chart, matching the Pine version's labels.
 //
 // Added beyond the Pine script, specifically for cTrader (all optional, off by default unless noted):
-//   - Risk-% position sizing (on by default) - volume is calculated from equity and each trade's actual
-//     stop distance, capped by a hard max-lots safety backstop.
+//   - Risk-% position sizing (on by default) - volume is calculated from current FREE MARGIN (not total
+//     equity) and each trade's actual stop distance, capped by a hard max-lots safety backstop. Sizing
+//     off free margin means each new trade automatically sizes down as more capital is already committed
+//     to open positions, rather than every trade sizing off the same static equity figure.
 //   - Take Profit At Confirmed TP Level - a close-confirmed profit target using the same support/
 //     resistance-style confirmation as the trailing stop, reusing the existing TP Increment step.
 //   - EMA Trend Filter - multi-timeframe confluence check (up to 7 independent timeframes, default
@@ -23,10 +25,11 @@
 //   - Multi-Symbol Mode - set "Traded Symbols" (comma-separated, e.g. "US100,GER40,EURUSD") to run this
 //     SAME strategy independently across several instruments from one running instance. Each symbol gets
 //     its own weekly high/low/open, EMA readings, window state, and open position - they never share
-//     signal state. They DO share account equity: risk-% sizing is calculated per trade off the live
-//     account equity at the time, so if more than one symbol is in a position simultaneously, the total %
-//     of equity at risk is the sum across them, not capped in aggregate. Leave "Traded Symbols" blank to
-//     keep the original single-symbol behavior (trades only the symbol this cBot is attached to).
+//     signal state. They DO share one account's free margin: risk-% sizing is calculated per trade off
+//     whatever free margin remains at that moment, so if several symbols are in a position at once, each
+//     new trade sizes off what's left after the margin already committed to the others - a self-tapering
+//     effect, though still not a hard cap on aggregate risk. Leave "Traded Symbols" blank to keep the
+//     original single-symbol behavior (trades only the symbol this cBot is attached to).
 //
 // NOT ported: the Anchored Volume Profile (purely visual, no effect on trading decisions - skipped by
 // request to keep this file focused on the trading logic).
@@ -187,7 +190,7 @@ namespace cAlgo.Robots
         public int MinTimeframesAgreeing { get; set; }
 
         [Parameter("Traded Symbols (comma-separated, blank = this chart's symbol only)", DefaultValue = "", Group = "Strategy",
-            Description = "Run this SAME strategy on several instruments from one running instance, e.g. 'US100,GER40,EURUSD'. Each symbol gets fully independent weekly high/low, EMA readings, window state, and position. They share account equity - risk-% sizing is calculated per trade off the live equity at that moment, so if several symbols are in a position at once, total equity at risk is the SUM across them, not capped in aggregate. Leave blank to trade only the symbol this cBot is attached to (identical to the original single-symbol behavior).")]
+            Description = "Run this SAME strategy on several instruments from one running instance, e.g. 'US100,GER40,EURUSD'. Each symbol gets fully independent weekly high/low, EMA readings, window state, and position. They share one account's free margin - risk-% sizing is calculated per trade off whatever free margin remains at that moment, so each new position across symbols sizes off what's left after the others already committed (self-tapering, though still not a hard aggregate cap). Leave blank to trade only the symbol this cBot is attached to (identical to the original single-symbol behavior).")]
         public string TradedSymbols { get; set; }
 
         [Parameter("Trade Longs (bearish-into-window fade)", DefaultValue = true, Group = "Strategy")]
@@ -211,8 +214,8 @@ namespace cAlgo.Robots
             Description = "Acts as a small error/tolerance band around the strict rule: a LONG is allowed anywhere below the weekly open, plus up to this % ABOVE it as a margin of error; a SHORT anywhere above the open, plus up to this % BELOW it. 0 = strict (long only below open, short only above).")]
         public double WeeklyOpenTolerancePercent { get; set; }
 
-        [Parameter("Risk % Of Equity Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
-            Description = "Position size is calculated from this % of current equity and the trade's actual stop-loss distance, so every trade risks the same amount regardless of how wide the stop is that week. Requires Use Stop Loss to be on. In multi-symbol mode this is applied per trade off the SAME shared account equity - it is not divided across symbols.")]
+        [Parameter("Risk % Of Free Margin Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
+            Description = "Position size is calculated from this % of current FREE margin (equity minus margin already committed to open positions) and the trade's actual stop-loss distance, so every trade risks the same amount regardless of how wide the stop is that week. Requires Use Stop Loss to be on. Using free margin rather than equity means later trades automatically size down as more capital gets committed - in multi-symbol mode, each new position sizes off whatever margin is left after the ones already open, instead of every trade sizing off the same static equity figure regardless of what's already committed.")]
         public double RiskPercent { get; set; }
 
         [Parameter("Max Position Size (lots)", DefaultValue = 5.0, MinValue = 0.01, Group = "Strategy",
@@ -885,12 +888,12 @@ namespace cAlgo.Robots
         }
 
         // Sizes the position so that a stop-loss hit at `stopDistance` away from entry loses RiskPercent%
-        // of current equity, capped at MaxVolumeLots as a hard safety backstop.
+        // of current FREE MARGIN (not total equity), capped at MaxVolumeLots as a hard safety backstop.
         private double CalculateVolume(SymbolState st, double stopDistance)
         {
             if (stopDistance <= 0) return st.Symbol.VolumeInUnitsMin;
 
-            double riskAmount = Account.Equity * RiskPercent / 100.0;
+            double riskAmount = Account.FreeMargin * RiskPercent / 100.0;
 
             double pips = stopDistance / st.Symbol.PipSize;
             double riskPerLot = pips * st.Symbol.PipValue;

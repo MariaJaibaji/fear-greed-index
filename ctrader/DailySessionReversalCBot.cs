@@ -11,7 +11,11 @@
 // What's kept the same as the weekly bot:
 //   - The full EMA Trend Filter: up to 7 independent timeframes, EMA Fast/Slow periods, Minimum
 //     Timeframes Agreeing confluence threshold - identical mechanism, identical defaults.
-//   - Risk-% position sizing (equity x Risk% / stop distance), capped by Max Position Size.
+//   - Risk-% position sizing (equity x Risk% / stop distance), capped by Max Position Size. Optional
+//     Conviction Sizing (off by default, this bot only) scales that risk % with EMA confluence strength:
+//     the bare-minimum allowed confluence (Minimum Timeframes Agreeing) risks Risk % Of Equity Per Trade,
+//     full confluence (every enabled timeframe agreeing) risks Max Conviction Risk %, and confluence
+//     counts in between are linearly interpolated. No effect if Use EMA Trend Filter is off.
 //   - Take Profit At Confirmed TP Level (close-confirmed exit through the TP ladder), same logic.
 //   - Real broker-side stop loss via Position.ModifyStopLossPrice.
 //
@@ -246,8 +250,16 @@ namespace cAlgo.Robots
         public double DailyOpenToleranceAtrMultiple { get; set; }
 
         [Parameter("Risk % Of Equity Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Strategy",
-            Description = "Position size is calculated from this % of current equity and the trade's actual stop-loss distance. Requires Use Stop Loss to be on.")]
+            Description = "Position size is calculated from this % of current equity and the trade's actual stop-loss distance. Requires Use Stop Loss to be on. This is the risk used at the WEAKEST allowed EMA confluence (exactly Minimum Timeframes Agreeing) when Use Conviction Sizing is on - see that parameter.")]
         public double RiskPercent { get; set; }
+
+        [Parameter("Use Conviction Sizing (scale risk % with EMA confluence)", DefaultValue = false, Group = "Strategy",
+            Description = "Off = every trade risks the same Risk % Of Equity regardless of how many EMA timeframes agree, as long as it clears Minimum Timeframes Agreeing. On = risk % scales linearly with EMA confluence strength: exactly Minimum Timeframes Agreeing agreeing -> Risk % Of Equity Per Trade; ALL enabled timeframes agreeing (e.g. 7/7) -> Max Conviction Risk %; agreement counts in between are interpolated. Has no effect if Use EMA Trend Filter is off, since there is no confluence count to scale on.")]
+        public bool UseConvictionSizing { get; set; }
+
+        [Parameter("Max Conviction Risk %", DefaultValue = 2.0, MinValue = 0.01, Group = "Strategy",
+            Description = "The risk % used when EVERY enabled EMA timeframe agrees (full confluence), when Use Conviction Sizing is on. Should normally be >= Risk % Of Equity Per Trade - a highest-conviction trade sized SMALLER than a bare-minimum-confluence one would be backwards.")]
+        public double MaxConvictionRiskPercent { get; set; }
 
         [Parameter("Max Position Size (lots)", DefaultValue = 5.0, MinValue = 0.01, Group = "Strategy",
             Description = "Hard safety cap on the risk-% sized volume.")]
@@ -593,9 +605,11 @@ namespace cAlgo.Robots
         // of guessing at parameters.
         private void LogDebugState(Bar calcBar)
         {
-            (string emaBias, string emaReason) = GetEmaTrendBias();
+            (string emaBias, string emaReason, int emaAgreeCount, int emaTotalCount) = GetEmaTrendBias();
             string direction = UseEmaTrendFilter ? emaBias : _dayMode;
             string directionInfo = UseEmaTrendFilter ? (emaReason ?? "n/a") : $"Daily-swing mode: {_dayMode ?? "none"} (>= {MaxDailySwingPercent}% from open {_dayOpen:F2})";
+            if (UseConvictionSizing && UseEmaTrendFilter)
+                directionInfo += $" | ConvictionRisk={GetConvictionRiskPercent(emaAgreeCount, emaTotalCount):F2}% (base {RiskPercent:F2}%, max {MaxConvictionRiskPercent:F2}% at {emaTotalCount}/{emaTotalCount})";
 
             (double level, int slot) = NearestConfirmedLevel(calcBar.Close);
             string nearInfo;
@@ -691,25 +705,42 @@ namespace cAlgo.Robots
             return list;
         }
 
-        private (string bias, string reason) GetEmaTrendBias()
+        // agreeCount/totalCount let the caller size conviction-based risk off the SAME confluence read used
+        // for the entry decision itself, instead of re-deriving it separately and risking the two drifting
+        // apart. agreeCount is 0 whenever bias is null (no confluence reached yet).
+        private (string bias, string reason, int agreeCount, int totalCount) GetEmaTrendBias()
         {
-            if (!UseEmaTrendFilter) return (null, null);
+            if (!UseEmaTrendFilter) return (null, null, 0, 0);
 
             var readings = CollectEmaDetails();
 
             if (readings.Count == 0)
-                return (null, "No EMA readings yet - every enabled timeframe is still NaN (needs EMA Slow Period bars of history on that timeframe to warm up)");
+                return (null, "No EMA readings yet - every enabled timeframe is still NaN (needs EMA Slow Period bars of history on that timeframe to warm up)", 0, 0);
 
             int longCount = readings.Count(r => r.trend == "long");
             int shortCount = readings.Count(r => r.trend == "short");
             string detail = string.Join(", ", readings.Select(r => $"{r.tf}={r.trend}"));
 
             if (longCount >= MinTimeframesAgreeing)
-                return ("long", $"EMA confluence {longCount}/{readings.Count} bullish ({detail})");
+                return ("long", $"EMA confluence {longCount}/{readings.Count} bullish ({detail})", longCount, readings.Count);
             if (shortCount >= MinTimeframesAgreeing)
-                return ("short", $"EMA confluence {shortCount}/{readings.Count} bearish ({detail})");
+                return ("short", $"EMA confluence {shortCount}/{readings.Count} bearish ({detail})", shortCount, readings.Count);
 
-            return (null, $"No confluence yet: {longCount} long / {shortCount} short of {readings.Count} readings warmed up, need {MinTimeframesAgreeing} to agree ({detail})");
+            return (null, $"No confluence yet: {longCount} long / {shortCount} short of {readings.Count} readings warmed up, need {MinTimeframesAgreeing} to agree ({detail})", 0, readings.Count);
+        }
+
+        // Linear ramp: exactly MinTimeframesAgreeing agreeing -> RiskPercent; ALL enabled timeframes
+        // agreeing -> MaxConvictionRiskPercent; in between is interpolated. Falls back to plain RiskPercent
+        // whenever conviction sizing isn't applicable (off, EMA filter off, or no room to scale because
+        // every enabled timeframe IS the minimum required).
+        private double GetConvictionRiskPercent(int agreeCount, int totalCount)
+        {
+            if (!UseConvictionSizing || !UseEmaTrendFilter) return RiskPercent;
+            if (totalCount <= MinTimeframesAgreeing) return RiskPercent;
+
+            double t = (double)(agreeCount - MinTimeframesAgreeing) / (totalCount - MinTimeframesAgreeing);
+            t = Math.Min(Math.Max(t, 0.0), 1.0);
+            return RiskPercent + (MaxConvictionRiskPercent - RiskPercent) * t;
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -722,7 +753,7 @@ namespace cAlgo.Robots
 
             DateTime localTime = TimeZoneInfo.ConvertTimeFromUtc(xBar.OpenTime, _sessionTz);
 
-            (string emaBias, string emaReason) = GetEmaTrendBias();
+            (string emaBias, string emaReason, int emaAgreeCount, int emaTotalCount) = GetEmaTrendBias();
             string direction = UseEmaTrendFilter ? emaBias : _dayMode;
             string dirReason = UseEmaTrendFilter ? emaReason : $"Daily-swing mode: {_dayMode ?? "none"} (>= {MaxDailySwingPercent}% from open {_dayOpen:F2})";
 
@@ -747,13 +778,13 @@ namespace cAlgo.Robots
                     if (direction == "long" && EnableLongs && openOkLong)
                     {
                         string reason = $"LONG @ {xBar.Close:F2}\n{dirReason}\nCheck Time {slot} S/R @ {level:F2} (touched)\nBelow daily open {_dayOpen:F2}";
-                        OpenPosition(TradeType.Buy, xBar, reason);
+                        OpenPosition(TradeType.Buy, xBar, reason, emaAgreeCount, emaTotalCount);
                         _tradedToday = true;
                     }
                     else if (direction == "short" && EnableShorts && openOkShort)
                     {
                         string reason = $"SHORT @ {xBar.Close:F2}\n{dirReason}\nCheck Time {slot} S/R @ {level:F2} (touched)\nAbove daily open {_dayOpen:F2}";
-                        OpenPosition(TradeType.Sell, xBar, reason);
+                        OpenPosition(TradeType.Sell, xBar, reason, emaAgreeCount, emaTotalCount);
                         _tradedToday = true;
                     }
                 }
@@ -814,14 +845,16 @@ namespace cAlgo.Robots
         // Position management
         // ---------------------------------------------------------------------------------------------
 
-        private void OpenPosition(TradeType type, Bar xBar, string reason)
+        private void OpenPosition(TradeType type, Bar xBar, string reason, int emaAgreeCount, int emaTotalCount)
         {
             double estEntry = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
             double estStopDist = UseStopLoss ? StopDistance(estEntry) : 0;
 
+            double effectiveRiskPercent = GetConvictionRiskPercent(emaAgreeCount, emaTotalCount);
+
             bool volumeCapped = false;
             double volumeInUnits = UseStopLoss && estStopDist > 0
-                ? CalculateVolume(estStopDist, out volumeCapped)
+                ? CalculateVolume(estStopDist, effectiveRiskPercent, out volumeCapped)
                 : Symbol.NormalizeVolumeInUnits(Symbol.QuantityToVolumeInUnits(FallbackVolumeLots));
 
             // The order comment is a single line (cTrader's Positions/History grid doesn't render \n
@@ -849,7 +882,8 @@ namespace cAlgo.Robots
             // recomputation from StopLossPercent/ATR - removes any doubt about what distance was really
             // used, especially under Use ATR-Relative Sizing where the distance depends on ATR at that instant.
             string stopStr = _openPosition.StopLoss.HasValue ? $"{_openPosition.StopLoss.Value:F2}" : "none";
-            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units (MaxLotsCapped={volumeCapped}) | FillPrice={_entryPrice:F2} StopLossPrice={stopStr} SpreadPips={spreadAtEntry:F2} Equity={Account.Equity:F2}");
+            string convictionStr = UseConvictionSizing && UseEmaTrendFilter ? $" ConvictionEMA={emaAgreeCount}/{emaTotalCount}" : "";
+            Print(reason.Replace("\n", " | ") + $" | Volume: {volumeInUnits} units (MaxLotsCapped={volumeCapped}) | RiskPercent={effectiveRiskPercent:F2}%{convictionStr} | FillPrice={_entryPrice:F2} StopLossPrice={stopStr} SpreadPips={spreadAtEntry:F2} Equity={Account.Equity:F2}");
             if (ShowReasons)
                 DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
         }
@@ -857,12 +891,12 @@ namespace cAlgo.Robots
         // wasCapped tells the caller whether MaxVolumeLots actually reduced the risk-% sized volume, so the
         // log can show it directly instead of it being an invisible silent cap - relevant for checking
         // whether position sizing keeps pace with equity growth (a hard cap binding would show up here).
-        private double CalculateVolume(double stopDistance, out bool wasCapped)
+        private double CalculateVolume(double stopDistance, double riskPercent, out bool wasCapped)
         {
             wasCapped = false;
             if (stopDistance <= 0) return Symbol.VolumeInUnitsMin;
 
-            double riskAmount = Account.Equity * RiskPercent / 100.0;
+            double riskAmount = Account.Equity * riskPercent / 100.0;
             double pips = stopDistance / Symbol.PipSize;
             double riskPerLot = pips * Symbol.PipValue;
             if (riskPerLot <= 0) return Symbol.VolumeInUnitsMin;

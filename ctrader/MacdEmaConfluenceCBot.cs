@@ -7,19 +7,22 @@
 // reversing into) that direction THE MOMENT the combined signal changes, not on every bar it happens to
 // hold (as specified - "immediate entry on confluence flip").
 //
-// ENTRY vs EXIT use different thresholds, deliberately (see EvaluateTradingLogic): entering still requires
-// full agreement (Min Timeframes Agreeing, default 3/3, on both indicators). But an open position is only
-// force-closed on a genuine REVERSAL - a fresh, full opposite-direction signal - not merely on losing that
-// full agreement (bias dropping to null, e.g. 2/3 or 1/3). Originally these used the same trigger (any
-// disagreement closed the position), and a real one-month backtest run showed why that was wrong: 69% of
-// trades (359/519) closed via that path alone, averaging 5.1 minutes held (99% under 15 minutes) - the
-// noisy 1-minute leg flickers out of 3/3 agreement almost immediately after nearly every entry, closing
-// trades before the ATR stop/target (or the dedicated 1min MACD fast-exit, see ProcessMacdTrailBar) ever
-// got a chance to matter. The fast-exit specifically never fired even once across those 519 trades, since
-// the broader "any disagreement" trigger always preempted it - an entire configured feature going silently
-// dead in practice. Splitting entry/exit thresholds lets a position ride through single-timeframe noise
-// while the slower timeframes still hold their view, protected by the ATR stop/target and the (now
-// actually reachable) fast-exit.
+// ENTRY and the signal-based EXIT are now fully SYMMETRICAL, deliberately, after two real backtest runs
+// exposed two different ways of getting this wrong (see EvaluateTradingLogic / ProcessMacdTrailBar):
+//   Attempt 1: entry required full agreement (Min Timeframes Agreeing, default 3/3, both indicators), exit
+//   fired on ANY disagreement (bias merely dropping to null, e.g. 2/3). Result: 69% of trades (359/519)
+//   closed via that path alone, averaging 5.1 minutes held (99% under 15 minutes) - the noisy 1-minute leg
+//   flickered out of 3/3 agreement almost immediately after nearly every entry.
+//   Attempt 2: fixed exit to require a genuine reversal (same 3/3 threshold as entry) for the SIGNAL-based
+//   close, but left a separate, asymmetric "1min MACD alone" fast-exit in place (no EMA or slower-timeframe
+//   confirmation needed to fire). Result: WORSE, not better (equity -26.7% vs -19%) - that fast-exit just
+//   took over the same role, firing on 318/505 trades (63%), averaging 6.3 minutes held. The 1-minute MACD
+//   on its own is simply too noisy to be a reliable exit signal at this resolution, symmetrical requirement
+//   or not.
+//   Current state: the ONLY signal-based close is a full reversal of the SAME combined bias used for entry
+//   (identical MinTimeframesAgreeing threshold, both indicators, all three timeframes) - entering and
+//   exiting-by-signal now use the exact same bar. The 1min MACD mechanism (see ProcessMacdTrailBar) is
+//   risk-management only now: it can tighten the stop, it can never independently end the trade.
 //
 // *** STATUS: BRAND NEW, LIGHTLY VALIDATED - ONE REAL BACKTEST RUN, STILL NOT TUNED ***
 // Every period/multiplier here is a reasonable-sounding starting point, not a tuned value: MACD(12,26,9)
@@ -52,14 +55,16 @@
 // turns out to be the wrong tradeoff in practice, resetting _lastCombinedBias to null in OnPositionsClosed
 // would make it re-enter immediately instead.
 //
-// 1min MACD trailing stop / fast exit (see ProcessMacdTrailBar): independent of the ATR stop above, a
-// dedicated 1-minute-only MACD (separate from the parameterized MACD Timeframe 1-3 slots, which could be
-// set to something else) is watched for its OWN crossovers on every 1-minute bar close, regardless of
-// Locked Execution Timeframe. A crossover AGAINST the open position's direction closes it immediately -
-// tighter and faster than waiting for the full 3-TF combined bias to flip. A crossover WITH the position's
-// direction (continued momentum after a shallow pullback) trails the stop to that crossover candle's low
-// (longs) / high (shorts), only ever tightening it, never loosening it - starts disengaged at entry and
-// first activates on the FIRST such crossover after entry, so the ATR stop protects the trade until then.
+// 1min MACD trailing stop (see ProcessMacdTrailBar): independent of the ATR stop above, a dedicated
+// 1-minute-only MACD (separate from the parameterized MACD Timeframe 1-3 slots, which could be set to
+// something else) is watched for its OWN crossovers on every 1-minute bar close, regardless of Locked
+// Execution Timeframe. A crossover WITH the position's direction (continued momentum after a shallow
+// pullback) trails the stop to that crossover candle's low (longs) / high (shorts), only ever tightening
+// it, never loosening it - starts disengaged at entry and first activates on the FIRST such crossover after
+// entry, so the ATR stop protects the trade until then. It does NOT close the position on an opposite-
+// direction crossover - an earlier version did, as a single-timeframe "fast exit," but that broke symmetry
+// with entry and made results worse in a real backtest (see the STATUS section above) - risk management
+// only now, never an independent signal-based exit.
 //
 // Cooldown After Close (minutes) applies uniformly after ANY close, including an immediate stop-and-
 // reverse on a fresh confluence flip - same precedent as the cooldown in GammaWallOvernightCBot.cs. This
@@ -196,8 +201,8 @@ namespace cAlgo.Robots
         private ExponentialMovingAverage _emaFast3, _emaSlow3;
 
         // Dedicated 1-minute MACD, independent of the MACD Timeframe 1-3 slots (which are parameterized
-        // and could point elsewhere) - always literally 1 minute, for the trailing stop / fast-exit
-        // mechanism described in the file header. Fires on its own BarOpened subscription rather than
+        // and could point elsewhere) - always literally 1 minute, for the trailing-stop mechanism
+        // described in the file header. Fires on its own BarOpened subscription rather than
         // piggybacking on OnExecBarOpened, so it stays truly 1-minute-responsive even if Locked Execution
         // Timeframe is changed away from Minute1.
         private Bars _macdTrailBars;
@@ -256,13 +261,13 @@ namespace cAlgo.Robots
             }
             catch (Exception ex)
             {
-                Print($"Warning: Exception loading {SymbolName} 1-minute bars for the MACD trailing-stop/fast-exit mechanism ({ex.Message}).");
+                Print($"Warning: Exception loading {SymbolName} 1-minute bars for the MACD trailing-stop mechanism ({ex.Message}).");
             }
             if (_macdTrailBars == null)
             {
-                // Non-fatal - only the 1min trail/fast-exit mechanism depends on this, not the core
+                // Non-fatal - only the 1min trailing-stop mechanism depends on this, not the core
                 // MACD+EMA confluence entries or the ATR stop/target.
-                Print("Warning: Could not load 1-minute bars for the MACD trailing-stop/fast-exit mechanism (see file header) - most likely no M1 history available for this symbol/range. That feature is disabled for this run; MACD/EMA confluence entries and the ATR stop/target still work normally.");
+                Print("Warning: Could not load 1-minute bars for the MACD trailing-stop mechanism (see file header) - most likely no M1 history available for this symbol/range. That feature is disabled for this run; MACD/EMA confluence entries and the ATR stop/target still work normally.");
             }
             else
             {
@@ -441,16 +446,13 @@ namespace cAlgo.Robots
 
             if (!flipped) return; // nothing changed since the last bar - don't touch anything
 
-            // Only force-close on a genuine REVERSAL - a fresh, full opposite-direction confluence signal -
-            // not merely on losing full agreement (bias dropping to null, e.g. 2/3 or 1/3). A real backtest
-            // run showed why that distinction matters: with the broader "any disagreement closes it" rule,
-            // 69% of trades (359/519) closed via this path alone, averaging 5.1 minutes held (99% under 15
-            // minutes) - the noisy 1-minute leg flickers out of 3/3 agreement almost immediately after every
-            // entry, closing trades before the ATR stop/target (or the dedicated 1min MACD fast-exit below)
-            // ever got a chance to matter; the fast-exit specifically never fired even once in that run,
-            // since this broader trigger always preempted it. Requiring an actual opposite signal - not
-            // just "no longer 3/3 in my favor" - lets a position ride through single-timeframe noise while
-            // the slower timeframes still hold their view.
+            // Only force-close on a genuine REVERSAL - a fresh, full opposite-direction confluence signal,
+            // the SAME threshold used for entry - not merely on losing full agreement (bias dropping to
+            // null, e.g. 2/3 or 1/3), and not via any narrower single-timeframe trigger either. See the
+            // STATUS section at the top of this file for the two real backtest runs that led here: a looser
+            // "any disagreement" exit closed 69% of trades in ~5 minutes on average, and a separate 1-minute-
+            // only fast-exit that replaced it made results WORSE, not better. This reversal check is the
+            // only signal-based way this bot closes a position now.
             if (_openPosition != null)
             {
                 bool isReversal = (bias == "long" && _openPosition.TradeType == TradeType.Sell)
@@ -473,7 +475,7 @@ namespace cAlgo.Robots
         }
 
         // ---------------------------------------------------------------------------------------------
-        // 1min MACD trailing stop / fast exit
+        // 1min MACD trailing stop
         // ---------------------------------------------------------------------------------------------
 
         private void OnMacdTrailBarOpened(BarOpenedEventArgs args)
@@ -482,12 +484,18 @@ namespace cAlgo.Robots
             ProcessMacdTrailBar(_macdTrailBars.Last(1));
         }
 
-        // Runs every 1-minute bar close, independent of Locked Execution Timeframe. Two effects on an open
-        // position, both keyed off the 1min MACD's OWN crossovers (edge-triggered, not just current state):
-        //   - A crossover AGAINST the position's direction closes it immediately - a faster, single-
-        //     timeframe early-warning exit than waiting for the full 3-TF combined bias to flip.
-        //   - A crossover WITH the position's direction (continued momentum) trails the stop to that
-        //     crossover candle's low (longs) / high (shorts), only ever tightening it.
+        // Runs every 1-minute bar close, independent of Locked Execution Timeframe. Only ever TIGHTENS risk
+        // on an open position - a same-direction 1min MACD crossover (continued momentum) trails the stop
+        // to that crossover candle's low (longs) / high (shorts). Deliberately does NOT close the position
+        // on an opposite-direction crossover anymore - an earlier version did (a "fast exit" ahead of the
+        // full 3-TF bias flipping), but that made exits asymmetric with entries: entry requires full 3/3
+        // MACD+EMA confluence across all three timeframes, while that fast-exit fired off the 1-minute
+        // MACD alone, no EMA or slower-timeframe confirmation needed. A real backtest showed the cost: it
+        // fired on 318/505 trades (63%), averaging 6.3 minutes held, and net results were WORSE than the
+        // even looser trigger it replaced - the 1min MACD is simply too noisy on its own to be a reliable
+        // exit signal, single-handedly, at this resolution. The only signal-based close now is the
+        // symmetrical one in EvaluateTradingLogic (a full reversal of the SAME combined bias used for
+        // entry) - this method only manages the stop, never independently ends the trade.
         // No position open -> nothing to manage, just keep the state tracker current for edge detection.
         private void ProcessMacdTrailBar(Bar bar)
         {
@@ -503,12 +511,7 @@ namespace cAlgo.Robots
 
             bool isLong = _openPosition.TradeType == TradeType.Buy;
             bool sameDirection = (isLong && state == "long") || (!isLong && state == "short");
-
-            if (!sameDirection)
-            {
-                CloseWithReason($"1min MACD crossed {state.ToUpper()} against the open {(isLong ? "long" : "short")} - exiting on this flip as configured", bar.Close, bar.OpenTime);
-                return;
-            }
+            if (!sameDirection) return; // no longer closes the position - see the method comment above
 
             if (!UseMacdTrailingStop) return;
 

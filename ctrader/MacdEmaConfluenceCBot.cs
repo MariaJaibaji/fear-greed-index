@@ -86,7 +86,7 @@ namespace cAlgo.Robots
         [Parameter("MACD Signal Period", DefaultValue = 9, MinValue = 1, Group = "MACD Trend Filter")]
         public int MacdSignalPeriod { get; set; }
 
-        [Parameter("MACD Timeframe 1", DefaultValue = "Minute1", Group = "MACD Trend Filter")]
+        [Parameter("MACD Timeframe 1", DefaultValue = "Minute", Group = "MACD Trend Filter")]
         public TimeFrame MacdTimeFrame1 { get; set; }
 
         [Parameter("MACD Timeframe 2", DefaultValue = "Minute5", Group = "MACD Trend Filter")]
@@ -104,7 +104,7 @@ namespace cAlgo.Robots
         [Parameter("EMA Slow Period", DefaultValue = 26, MinValue = 1, Group = "EMA Trend Filter")]
         public int EmaSlowPeriod { get; set; }
 
-        [Parameter("EMA Timeframe 1", DefaultValue = "Minute1", Group = "EMA Trend Filter")]
+        [Parameter("EMA Timeframe 1", DefaultValue = "Minute", Group = "EMA Trend Filter")]
         public TimeFrame EmaTimeFrame1 { get; set; }
 
         [Parameter("EMA Timeframe 2", DefaultValue = "Minute5", Group = "EMA Trend Filter")]
@@ -158,7 +158,7 @@ namespace cAlgo.Robots
             Description = "Prints one diagnostic line per Locked Execution Timeframe bar: MACD/EMA readings per timeframe and the resulting combined bias.")]
         public bool EnableDebugLogging { get; set; }
 
-        [Parameter("Locked Execution Timeframe", DefaultValue = "Minute1", Group = "Strategy",
+        [Parameter("Locked Execution Timeframe", DefaultValue = "Minute", Group = "Strategy",
             Description = "Drives when EvaluateTradingLogic runs (once per bar close on this timeframe) and which bars the ATR stop/target is computed from - independent of the MACD/EMA timeframes above.")]
         public TimeFrame ExecutionTimeFrame { get; set; }
 

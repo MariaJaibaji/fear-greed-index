@@ -209,9 +209,15 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
+            // Prefer the cBot's own native chart Bars over a fresh MarketData.GetBars() request whenever the
+            // requested timeframe matches the chart's own - Bars is guaranteed already loaded (it's what the
+            // chart itself is displaying), whereas a separate GetBars() request asks the platform to load or
+            // subscribe a distinct series on demand, which has been observed to fail ("Failed to load symbol
+            // data") even for a recent date/timeframe that plainly has history. Falls back to GetBars() only
+            // when a genuinely different timeframe is requested.
             try
             {
-                _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
+                _execBars = ExecutionTimeFrame == Bars.TimeFrame ? Bars : MarketData.GetBars(ExecutionTimeFrame, SymbolName);
             }
             catch (Exception ex)
             {
@@ -232,7 +238,7 @@ namespace cAlgo.Robots
 
             try
             {
-                _macdTrailBars = MarketData.GetBars(TimeFrame.Minute, SymbolName);
+                _macdTrailBars = Bars.TimeFrame == TimeFrame.Minute ? Bars : MarketData.GetBars(TimeFrame.Minute, SymbolName);
             }
             catch (Exception ex)
             {

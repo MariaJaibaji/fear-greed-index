@@ -408,6 +408,18 @@ namespace cAlgo.Robots
         private Dictionary<DateTime, int> _sweepDateCounts = new Dictionary<DateTime, int>();
         private const int SweepItemsPerTick = 2;
 
+        // Informational-only extremes across the current sweep: the highest Call Wall and lowest Put Wall
+        // seen among the expirations discovered this session (degenerate call==put rows excluded). NOT
+        // used in any entry/exit logic - see DrawSweepExtremesLabel for the caveats on what these numbers
+        // do and don't mean. _sweepTotalCount doubles as a "sweep pending" flag: >0 while a sweep is queued
+        // or in progress, reset to 0 once its extremes have been drawn so ProcessSweepQueueTick doesn't
+        // redraw on every subsequent idle tick.
+        private double _sweepExtremeCallWall = double.NaN;
+        private string _sweepExtremeCallWallExpiration;
+        private double _sweepExtremePutWall = double.NaN;
+        private string _sweepExtremePutWallExpiration;
+        private int _sweepTotalCount;
+
         // Minimum cooldown after ANY position close before a new entry is allowed - guards against the
         // regime-flip exit immediately reopening a position in the opposite direction on the same or next
         // bar if price is choppy right around the Gamma Flip level (which can sit close to a wall on
@@ -986,6 +998,13 @@ namespace cAlgo.Robots
             foreach (var e in expirations)
                 _sweepDateCounts[e.date] = _sweepDateCounts.TryGetValue(e.date, out int c) ? c + 1 : 1;
 
+            // Fresh sweep, fresh extremes - see the field comment.
+            _sweepExtremeCallWall = double.NaN;
+            _sweepExtremeCallWallExpiration = null;
+            _sweepExtremePutWall = double.NaN;
+            _sweepExtremePutWallExpiration = null;
+            _sweepTotalCount = expirations.Count;
+
             if (expirations.Count > 0)
                 Print($"[SWEEP] === Weekly gamma sweep queued: {expirations.Count} expiration(s) over the next {WeeklySweepMaxDays} days, processing {SweepItemsPerTick}/tick to avoid a long blocking burst ===");
             else
@@ -1001,6 +1020,13 @@ namespace cAlgo.Robots
             {
                 var (expirationId, date) = _sweepQueue.Dequeue();
                 SweepOneExpiration(expirationId, date);
+            }
+
+            // Sweep just drained - draw the extremes label once, not on every idle tick afterward.
+            if (_sweepQueue.Count == 0 && _sweepTotalCount > 0)
+            {
+                DrawSweepExtremesLabel();
+                _sweepTotalCount = 0;
             }
         }
 
@@ -1036,9 +1062,27 @@ namespace cAlgo.Robots
                 string overlapNote = _sweepDateCounts.TryGetValue(date, out int cnt) && cnt > 1
                     ? " [MONTHLY/WEEKLY OVERLAP DATE - two series listed, treat both with caution]"
                     : "";
-                string degenerateNote = callWall == putWall ? " [DEGENERATE - walls identical, low confidence]" : "";
+                bool degenerate = callWall == putWall;
+                string degenerateNote = degenerate ? " [DEGENERATE - walls identical, low confidence]" : "";
 
                 Print($"[SWEEP] {date:yyyy-MM-dd} ({expirationId}): CallWall={callWall:F2} PutWall={putWall:F2} GammaFlip={flipStr} ConcentrationPrice={concStrike:F2}{contractsStr}{overlapNote}{degenerateNote}");
+
+                // Feed the informational extremes tracker - degenerate rows excluded, same low-data-quality
+                // signal used elsewhere in this file. No other filtering (e.g. by distance from spot) is
+                // applied - see DrawSweepExtremesLabel for why that's shown as a caveat instead of a filter.
+                if (!degenerate)
+                {
+                    if (double.IsNaN(_sweepExtremeCallWall) || callWall > _sweepExtremeCallWall)
+                    {
+                        _sweepExtremeCallWall = callWall;
+                        _sweepExtremeCallWallExpiration = expirationId;
+                    }
+                    if (double.IsNaN(_sweepExtremePutWall) || putWall < _sweepExtremePutWall)
+                    {
+                        _sweepExtremePutWall = putWall;
+                        _sweepExtremePutWallExpiration = expirationId;
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1694,6 +1738,34 @@ namespace cAlgo.Robots
             Chart.DrawTrendLine("CallWall", now, _gamma.CallWall, end, _gamma.CallWall, Color.Red, 2, LineStyle.Dots);
             Chart.DrawTrendLine("PutWall", now, _gamma.PutWall, end, _gamma.PutWall, Color.Green, 2, LineStyle.Dots);
             Chart.DrawTrendLine("GammaFlip", now, _gamma.GammaFlip, end, _gamma.GammaFlip, Color.Yellow, 2, LineStyle.Dots);
+        }
+
+        // Purely informational - the highest Call Wall and lowest Put Wall seen across this week's swept
+        // expirations (see SweepOneExpiration/BuildSweepQueue). NOT a support/resistance claim and NOT
+        // used anywhere in entry/exit logic. Deliberately shown RAW rather than filtered by distance from
+        // spot: the more distant expirations are swept before they've accumulated much real trading
+        // activity, so an extreme far from spot may be a genuine level or may just be sparse-data noise
+        // from a still-thin book - there's no reliable way to tell which from a single snapshot, so both
+        // possibilities are left visible rather than one being silently filtered out on assumption.
+        private void DrawSweepExtremesLabel()
+        {
+            if (double.IsNaN(_sweepExtremeCallWall) && double.IsNaN(_sweepExtremePutWall)) return;
+
+            string text = $"Week sweep extremes (informational, raw, not a trade level): Call Wall high {_sweepExtremeCallWall:F2} ({_sweepExtremeCallWallExpiration}) | Put Wall low {_sweepExtremePutWall:F2} ({_sweepExtremePutWallExpiration})";
+            Print($"[SWEEP] {text}");
+
+            Chart.RemoveObject("SweepExtremeCallWall");
+            Chart.RemoveObject("SweepExtremePutWall");
+            Chart.RemoveObject("SweepExtremeLabel");
+
+            var now = Server.TimeInUtc;
+            var end = now.AddDays(WeeklySweepMaxDays);
+            Chart.DrawTrendLine("SweepExtremeCallWall", now, _sweepExtremeCallWall, end, _sweepExtremeCallWall, Color.OrangeRed, 1, LineStyle.LinesDots);
+            Chart.DrawTrendLine("SweepExtremePutWall", now, _sweepExtremePutWall, end, _sweepExtremePutWall, Color.DodgerBlue, 1, LineStyle.LinesDots);
+
+            var label = Chart.DrawText("SweepExtremeLabel", text, now, _sweepExtremeCallWall, Color.Silver);
+            label.VerticalAlignment = VerticalAlignment.Top;
+            label.HorizontalAlignment = HorizontalAlignment.Left;
         }
     }
 }

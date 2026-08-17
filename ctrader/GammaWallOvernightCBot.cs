@@ -362,10 +362,26 @@ namespace cAlgo.Robots
         private int _objCounter;
 
         private bool _standDownForBadGammaData; // monthly/weekly overlap or degenerate (call_wall == put_wall) data
-        private DateTime? _lastSweepDate; // local calendar date (SessionTimeZoneId) the weekly sweep last ran on
+        private bool _isBackwardation; // near-term ATM IV > far-term ATM IV, refreshed once per session
 
-        private bool _isBackwardation; // near-term ATM IV > far-term ATM IV, refreshed once per day
-        private DateTime? _lastTermStructureCheckDate;
+        // Pinned once per overnight session so a mid-session rollover in the site's own "nearest expiration"
+        // resolution can't silently swap which expiration's (supposedly frozen) levels are being traded -
+        // see RefreshGammaLevels(). Cleared whenever we're not in-session, so the next session re-pins fresh.
+        private string _pinnedExpirationId;
+        private DateTime? _currentSessionStartDate; // local calendar date the ACTIVE session started on
+
+        // Weekly sweep is processed a couple of items per tick (see ProcessSweepQueueTick) rather than all
+        // at once, so the one-per-day discovery burst can't block the cBot's thread for an extended period.
+        private Queue<(string expirationId, DateTime date)> _sweepQueue = new Queue<(string, DateTime)>();
+        private Dictionary<DateTime, int> _sweepDateCounts = new Dictionary<DateTime, int>();
+        private const int SweepItemsPerTick = 2;
+
+        // Minimum cooldown after ANY position close before a new entry is allowed - guards against the
+        // regime-flip exit immediately reopening a position in the opposite direction on the same or next
+        // bar if price is choppy right around the Gamma Flip level (which can sit close to a wall on
+        // thin-data days), which would otherwise churn repeatedly at real spread/slippage cost each time.
+        private DateTime? _lastCloseUtc;
+        private const int MinSecondsBetweenTrades = 300;
 
         // ---------------------------------------------------------------------------------------------
         // Lifecycle
@@ -411,18 +427,8 @@ namespace cAlgo.Robots
 
             Positions.Closed += OnPositionsClosed;
 
-            RefreshGammaLevels(); // get an initial read before waiting for the first timer tick
-            DateTime startLocalDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
-            if (RunWeeklySweep)
-            {
-                RunWeeklyGammaSweep();
-                _lastSweepDate = startLocalDate;
-            }
-            if (UseVolatilityConviction)
-            {
-                RefreshVolatilityTermStructure();
-                _lastTermStructureCheckDate = startLocalDate;
-            }
+            CheckSessionTransition(); // pins the expiration + runs the daily sweep/IV setup if we're starting mid-session
+            RefreshGammaLevels(); // get an initial read before waiting for the first timer tick (also a no-op-safe re-fetch if the line above already did one)
             Timer.Start(TimeSpan.FromMinutes(GammaRefreshMinutes));
         }
 
@@ -439,6 +445,8 @@ namespace cAlgo.Robots
         // without needing a second Timer.
         protected override void OnTimer()
         {
+            CheckSessionTransition(); // detects a new session starting, pins the expiration, kicks off daily setup
+
             bool marketClosed = IsMarketClosedWindow(Server.TimeInUtc);
             double minutesSinceLastFetch = _gamma.FetchedUtc == DateTime.MinValue
                 ? double.MaxValue
@@ -450,19 +458,43 @@ namespace cAlgo.Robots
 
             if (dueForRefresh) RefreshGammaLevels();
 
-            DateTime tickLocalDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
+            ProcessSweepQueueTick(); // pops a couple of pending sweep items, if any - see the field comment
+        }
 
-            if (RunWeeklySweep && (_lastSweepDate == null || tickLocalDate != _lastSweepDate.Value))
+        private DateTime GetSessionStartDate(DateTime localTime)
+        {
+            int nowMinutes = localTime.Hour * 60 + localTime.Minute;
+            int startMinutes = SessionStartHour * 60 + SessionStartMinute;
+            // On/after session start -> today IS the start date. Before it -> we're in the early-morning
+            // tail of a session that started yesterday (only meaningful to call this while inSession==true).
+            return nowMinutes >= startMinutes ? localTime.Date : localTime.Date.AddDays(-1);
+        }
+
+        // Runs ONCE per overnight session, the moment it begins - pins the expiration (see the
+        // _pinnedExpirationId field comment) and kicks off the once-per-day sweep/IV-term-structure setup.
+        // Replaces the old calendar-midnight-triggered daily checks, which fired in the middle of a session
+        // that actually starts in the evening, not at midnight - this fires right at session start instead,
+        // so the conviction signals are fresh for the WHOLE session rather than already stale for its
+        // first several hours.
+        private void CheckSessionTransition()
+        {
+            var (inSession, localTime) = GetSessionState(Server.TimeInUtc);
+            if (!inSession)
             {
-                RunWeeklyGammaSweep();
-                _lastSweepDate = tickLocalDate;
+                _currentSessionStartDate = null;
+                _pinnedExpirationId = null; // release the pin so the next session starts fresh
+                return;
             }
 
-            if (UseVolatilityConviction && (_lastTermStructureCheckDate == null || tickLocalDate != _lastTermStructureCheckDate.Value))
-            {
-                RefreshVolatilityTermStructure();
-                _lastTermStructureCheckDate = tickLocalDate;
-            }
+            DateTime sessionStartDate = GetSessionStartDate(localTime);
+            if (_currentSessionStartDate != null && _currentSessionStartDate.Value == sessionStartDate)
+                return; // already set up for this session
+
+            _currentSessionStartDate = sessionStartDate;
+            Print($"[SESSION] New overnight session starting ({sessionStartDate:yyyy-MM-dd} local) - pinning gamma expiration and refreshing daily conviction signals.");
+
+            if (RunWeeklySweep) BuildSweepQueue();
+            if (UseVolatilityConviction) RefreshVolatilityTermStructure();
         }
 
         private bool IsMarketClosedWindow(DateTime timeUtc)
@@ -523,7 +555,14 @@ namespace cAlgo.Robots
         {
             try
             {
-                string gexHtml = _http.GetStringAsync(BuildGammaExposureUrl(GammaExpirationOverride)).Result;
+                // Once a session has pinned an expiration, ALWAYS use that exact one, ignoring whatever
+                // the site would otherwise resolve as "nearest" - see the _pinnedExpirationId field
+                // comment for why this matters. An explicit user override always wins outright.
+                string effectiveOverride = !string.IsNullOrWhiteSpace(GammaExpirationOverride)
+                    ? GammaExpirationOverride
+                    : _pinnedExpirationId;
+
+                string gexHtml = _http.GetStringAsync(BuildGammaExposureUrl(effectiveOverride)).Result;
                 var (callWall, putWall, expirationId, expirationUnix) = ParseGammaExposureHtml(gexHtml);
                 if (double.IsNaN(callWall) || double.IsNaN(putWall) || expirationId == null)
                 {
@@ -531,12 +570,23 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                if (SkipMonthlyOverlapDays && IsUnreliableGammaDay(callWall, putWall, expirationId))
+                bool inSession = GetSessionState(Server.TimeInUtc).inSession;
+                bool isNewPinThisSession = inSession && _pinnedExpirationId == null;
+                if (isNewPinThisSession)
+                {
+                    _pinnedExpirationId = expirationId;
+                    Print($"[GAMMA] Pinned this session to expiration '{expirationId}' - will keep using this exact expiration for the rest of the overnight session, regardless of what the site later resolves as 'nearest'.");
+                }
+
+                // The overlap/degenerate-data check makes its own extra HTTP call and only needs to run
+                // ONCE per session (the answer is a fixed fact about today's date, not something that
+                // changes on re-fetch) - gated to the pin moment rather than every refresh.
+                if (isNewPinThisSession && SkipMonthlyOverlapDays && IsUnreliableGammaDay(callWall, putWall, expirationId))
                 {
                     _standDownForBadGammaData = true;
                     return; // reason already logged by IsUnreliableGammaDay
                 }
-                _standDownForBadGammaData = false;
+                if (isNewPinThisSession) _standDownForBadGammaData = false;
 
                 string chainHtml = _http.GetStringAsync(BuildOptionChainUrl(expirationId)).Result;
                 var (spot, legs) = ParseOptionChainHtml(chainHtml);
@@ -860,66 +910,77 @@ namespace cAlgo.Robots
             return result;
         }
 
-        // Runs once per calendar day (triggered from OnTimer - see _lastSweepDate). Purely informational:
-        // logs Call Wall / Put Wall / Gamma Flip / Concentration Price for every expiration listed over the
-        // next Weekly Sweep Max Days, so you can track outcomes against your concentration-price hypothesis
-        // over time. Does not feed into any trading decision.
-        private void RunWeeklyGammaSweep()
+        // Runs once per session (triggered from CheckSessionTransition), but only DISCOVERS the list and
+        // queues it - see ProcessSweepQueueTick for why the actual fetching is spread across ticks instead
+        // of done here in one blocking burst.
+        private void BuildSweepQueue()
         {
             var expirations = DiscoverUpcomingExpirations(WeeklySweepMaxDays);
-            if (expirations.Count == 0)
-            {
-                Print("[SWEEP] No upcoming expirations discovered - skipping this sweep.");
-                return;
-            }
-
-            Print($"[SWEEP] === Weekly gamma sweep ({expirations.Count} expiration(s) over the next {WeeklySweepMaxDays} days) ===");
+            _sweepQueue = new Queue<(string, DateTime)>(expirations);
 
             // Track which calendar dates have more than one listed expiration (the monthly-overlap case),
             // purely for a clearer log annotation - doesn't change what gets fetched/computed.
-            var dateCounts = new Dictionary<DateTime, int>();
+            _sweepDateCounts = new Dictionary<DateTime, int>();
             foreach (var e in expirations)
-                dateCounts[e.date] = dateCounts.TryGetValue(e.date, out int c) ? c + 1 : 1;
+                _sweepDateCounts[e.date] = _sweepDateCounts.TryGetValue(e.date, out int c) ? c + 1 : 1;
 
-            double nowUnix = (Server.TimeInUtc - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+            if (expirations.Count > 0)
+                Print($"[SWEEP] === Weekly gamma sweep queued: {expirations.Count} expiration(s) over the next {WeeklySweepMaxDays} days, processing {SweepItemsPerTick}/tick to avoid a long blocking burst ===");
+            else
+                Print("[SWEEP] No upcoming expirations discovered - skipping this sweep.");
+        }
 
-            foreach (var (expirationId, date) in expirations)
+        // Pops a few pending sweep items off the queue each tick (called from OnTimer) instead of walking
+        // the whole list in one shot, which could otherwise mean 20-30+ sequential blocking HTTP calls in a
+        // single OnTimer invocation - a real risk of stalling the cBot's thread for an extended period.
+        private void ProcessSweepQueueTick()
+        {
+            for (int i = 0; i < SweepItemsPerTick && _sweepQueue.Count > 0; i++)
             {
-                try
+                var (expirationId, date) = _sweepQueue.Dequeue();
+                SweepOneExpiration(expirationId, date);
+            }
+        }
+
+        // Logs Call Wall / Put Wall / Gamma Flip / Concentration Price for one expiration - purely
+        // informational, does not feed into any trading decision.
+        private void SweepOneExpiration(string expirationId, DateTime date)
+        {
+            try
+            {
+                string gexHtml = _http.GetStringAsync(BuildGammaExposureUrl(expirationId)).Result;
+                var (callWall, putWall, resolvedId, expirationUnix) = ParseGammaExposureHtml(gexHtml);
+                if (double.IsNaN(callWall) || double.IsNaN(putWall))
                 {
-                    string gexHtml = _http.GetStringAsync(BuildGammaExposureUrl(expirationId)).Result;
-                    var (callWall, putWall, resolvedId, expirationUnix) = ParseGammaExposureHtml(gexHtml);
-                    if (double.IsNaN(callWall) || double.IsNaN(putWall))
-                    {
-                        Print($"[SWEEP] {expirationId}: no usable wall data.");
-                        continue;
-                    }
-
-                    var (concStrike, concWeight) = ComputeConcentrationStrike(gexHtml);
-
-                    string chainHtml = _http.GetStringAsync(BuildOptionChainUrl(expirationId)).Result;
-                    var (spot, legs) = ParseOptionChainHtml(chainHtml);
-
-                    string flipStr = "n/a";
-                    string contractsStr = "";
-                    if (!double.IsNaN(spot) && legs.Count > 0)
-                    {
-                        double flip = ComputeGammaFlip(legs, spot, expirationUnix, nowUnix, out int contractsUsed);
-                        flipStr = double.IsNaN(flip) ? "n/a" : flip.ToString("F2");
-                        contractsStr = $", {contractsUsed}/{legs.Count} contracts";
-                    }
-
-                    string overlapNote = dateCounts.TryGetValue(date, out int cnt) && cnt > 1
-                        ? " [MONTHLY/WEEKLY OVERLAP DATE - two series listed, treat both with caution]"
-                        : "";
-                    string degenerateNote = callWall == putWall ? " [DEGENERATE - walls identical, low confidence]" : "";
-
-                    Print($"[SWEEP] {date:yyyy-MM-dd} ({expirationId}): CallWall={callWall:F2} PutWall={putWall:F2} GammaFlip={flipStr} ConcentrationPrice={concStrike:F2}{contractsStr}{overlapNote}{degenerateNote}");
+                    Print($"[SWEEP] {expirationId}: no usable wall data.");
+                    return;
                 }
-                catch (Exception ex)
+
+                var (concStrike, concWeight) = ComputeConcentrationStrike(gexHtml);
+
+                string chainHtml = _http.GetStringAsync(BuildOptionChainUrl(expirationId)).Result;
+                var (spot, legs) = ParseOptionChainHtml(chainHtml);
+
+                string flipStr = "n/a";
+                string contractsStr = "";
+                if (!double.IsNaN(spot) && legs.Count > 0)
                 {
-                    Print($"[SWEEP] {expirationId}: fetch/compute failed ({ex.Message}).");
+                    double nowUnix = (Server.TimeInUtc - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                    double flip = ComputeGammaFlip(legs, spot, expirationUnix, nowUnix, out int contractsUsed);
+                    flipStr = double.IsNaN(flip) ? "n/a" : flip.ToString("F2");
+                    contractsStr = $", {contractsUsed}/{legs.Count} contracts";
                 }
+
+                string overlapNote = _sweepDateCounts.TryGetValue(date, out int cnt) && cnt > 1
+                    ? " [MONTHLY/WEEKLY OVERLAP DATE - two series listed, treat both with caution]"
+                    : "";
+                string degenerateNote = callWall == putWall ? " [DEGENERATE - walls identical, low confidence]" : "";
+
+                Print($"[SWEEP] {date:yyyy-MM-dd} ({expirationId}): CallWall={callWall:F2} PutWall={putWall:F2} GammaFlip={flipStr} ConcentrationPrice={concStrike:F2}{contractsStr}{overlapNote}{degenerateNote}");
+            }
+            catch (Exception ex)
+            {
+                Print($"[SWEEP] {expirationId}: fetch/compute failed ({ex.Message}).");
             }
         }
 
@@ -952,14 +1013,15 @@ namespace cAlgo.Robots
             return ivs.Count > 0 ? ivs.Average() : double.NaN;
         }
 
-        // Runs once per calendar day (see OnTimer). Compares near-term ATM IV (the same default/nearest
-        // expiration RefreshGammaLevels trades off) against a far-term expiration near Far-Term Expiration
-        // Target days out, picked from whatever's actually listed rather than assumed.
+        // Runs once per session (see CheckSessionTransition). Compares near-term ATM IV (the SAME pinned
+        // expiration RefreshGammaLevels trades off, when a pin exists) against a far-term expiration near
+        // Far-Term Expiration Target days out, picked from whatever's actually listed rather than assumed.
         private void RefreshVolatilityTermStructure()
         {
             try
             {
-                string nearGexHtml = _http.GetStringAsync(BuildGammaExposureUrl(GammaExpirationOverride)).Result;
+                string nearOverride = !string.IsNullOrWhiteSpace(GammaExpirationOverride) ? GammaExpirationOverride : _pinnedExpirationId;
+                string nearGexHtml = _http.GetStringAsync(BuildGammaExposureUrl(nearOverride)).Result;
                 var (_, _, nearExpirationId, nearExpirationUnix) = ParseGammaExposureHtml(nearGexHtml);
                 if (nearExpirationId == null) { Print("[IV] Could not resolve near-term expiration - skipping term structure check."); return; }
 
@@ -1251,6 +1313,15 @@ namespace cAlgo.Robots
 
             if (_openPosition != null || emaBias == null) return;
 
+            // Cooldown after ANY close (including the regime-flip exit just above, which can otherwise
+            // reopen a position in the opposite direction on the same or next bar if price is choppy right
+            // around the Gamma Flip level) - see the _lastCloseUtc field comment.
+            if (_lastCloseUtc != null && (Server.TimeInUtc - _lastCloseUtc.Value).TotalSeconds < MinSecondsBetweenTrades)
+            {
+                if (EnableDebugLogging) Print($"[DEBUG] Standing aside - {MinSecondsBetweenTrades}s cooldown after last close not yet elapsed ({(Server.TimeInUtc - _lastCloseUtc.Value).TotalSeconds:F0}s so far)");
+                return;
+            }
+
             if (positiveGamma)
                 TryFadeEntry(xBar, emaBias, regime);
             else
@@ -1399,6 +1470,7 @@ namespace cAlgo.Robots
             ClosePosition(_openPosition);
             _openPosition = null;
             _entryRegime = null;
+            _lastCloseUtc = Server.TimeInUtc;
         }
 
         private void OnPositionsClosed(PositionClosedEventArgs args)
@@ -1418,6 +1490,7 @@ namespace cAlgo.Robots
             {
                 _openPosition = null;
                 _entryRegime = null;
+                _lastCloseUtc = Server.TimeInUtc;
             }
         }
 

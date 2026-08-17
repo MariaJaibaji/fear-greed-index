@@ -164,6 +164,56 @@ namespace cAlgo.Robots
             Description = "If the feed hasn't been SUCCESSFULLY fetched within this many minutes, treat levels as stale and stand aside - this catches the fetcher/feed silently dying, not the underlying market values being unchanged. Set comfortably above Gamma Refresh - Market Closed (default 60min) so the slower overnight cadence itself doesn't trip this - default 90 gives a 30min buffer over one missed hourly refresh.")]
         public int MaxGammaDataAgeMinutes { get; set; }
 
+        // -----------------------------------------------------------------------------------------------
+        // Volatility Conviction - three mechanisms, each grounded in a specific real result checked
+        // against 529 days of real NDX daily options history before being implemented:
+        //   1. Negative gamma sees ~54% bigger next-day moves than positive gamma (0.865% vs 1.330% mean
+        //      |return|) - widens the stop/target on breakout (negative-gamma) trades specifically, since
+        //      fade trades only ever fire in positive gamma and don't need this.
+        //   2. IV term structure backwardation (near-term ATM IV > ~30d ATM IV) independently predicts
+        //      bigger moves too (0.815% vs 1.171%, and combined with negative gamma: 0.776% neither ->
+        //      1.447% both - close to double) - boosts risk-% on BOTH trade types when detected.
+        //   3. Monthly OPEX pinning-then-release: price drifts away from Max Pain at only +0.019%/day in
+        //      the 10 trading days before monthly OPEX (t=2.56 vs the post-OPEX rate, real effect) then
+        //      +0.212%/day after - boosts fade-trade risk-% in the pinned pre-OPEX window, reduces it in
+        //      the just-released post-OPEX window. FADE TRADES ONLY - this is specifically about pinning
+        //      reliability, which is what fades depend on; breakout trades don't rely on that premise.
+        //      Tested and explicitly did NOT replicate for weekly (Friday) expirations at 4x the sample
+        //      size, so this is scoped to monthly (3rd Friday) OPEX only, not applied every week.
+        // -----------------------------------------------------------------------------------------------
+
+        [Parameter("Use Volatility Conviction", DefaultValue = true, Group = "Volatility Conviction",
+            Description = "Master toggle for all three mechanisms above. Off = plain Risk % Of Free Margin Per Trade and unwidened stops everywhere, matching the original behavior.")]
+        public bool UseVolatilityConviction { get; set; }
+
+        [Parameter("Negative Gamma Stop/Target Widen Factor", DefaultValue = 1.5, MinValue = 1.0, Group = "Volatility Conviction",
+            Description = "Multiplies Stop Buffer Beyond Wall % (and therefore the R:R-derived target distance too) for BREAKOUT trades only, since those only fire in negative gamma. Default 1.5 matches the real measured ratio (1.330%/0.865% = 1.54x) of next-day move size in negative vs positive gamma.")]
+        public double NegativeGammaStopWidenFactor { get; set; }
+
+        [Parameter("Far-Term Expiration Target (days out)", DefaultValue = 30, MinValue = 7, Group = "Volatility Conviction",
+            Description = "How many calendar days out to look for the far-term IV comparison point (checked once per day, not every refresh - term structure doesn't move fast enough to need 5-minute freshness).")]
+        public int FarTermExpirationDaysTarget { get; set; }
+
+        [Parameter("Backwardation Risk Multiplier", DefaultValue = 1.3, MinValue = 1.0, Group = "Volatility Conviction",
+            Description = "Risk % multiplier applied to BOTH trade types when near-term ATM IV > far-term ATM IV (backwardation - a real, independent stress signal in the checked data). Applies on top of the OPEX multiplier below for fade trades, so both-signals-aligned fades get compounded conviction, matching the real combined effect being close to double the baseline.")]
+        public double BackwardationRiskMultiplier { get; set; }
+
+        [Parameter("OPEX Pre-Window (trading days)", DefaultValue = 10, MinValue = 1, Group = "Volatility Conviction",
+            Description = "Fade trades in the N trading days BEFORE monthly OPEX get the boosted multiplier below - this is the window that measured genuinely flat/pinned (near-zero drift rate) in real data.")]
+        public int OpexPreWindowTradingDays { get; set; }
+
+        [Parameter("OPEX Pre-Window Risk Multiplier", DefaultValue = 1.2, MinValue = 1.0, Group = "Volatility Conviction",
+            Description = "Deliberately more conservative than the raw 11x drift-rate finding would suggest - that stat measures RATE OF DRIFT, not return magnitude, so it isn't directly a sizing number. Treat this as a modest, judgment-adjusted translation of a real but differently-shaped result, not a precise calibration.")]
+        public double OpexPreWindowRiskMultiplier { get; set; }
+
+        [Parameter("OPEX Post-Window (trading days)", DefaultValue = 5, MinValue = 1, Group = "Volatility Conviction",
+            Description = "Fade trades in the N trading days AFTER monthly OPEX get the reduced multiplier below - the old pinning anchor has just released and fade reliability is specifically weaker right here.")]
+        public int OpexPostWindowTradingDays { get; set; }
+
+        [Parameter("OPEX Post-Window Risk Multiplier", DefaultValue = 0.8, MinValue = 0.1, MaxValue = 1.0, Group = "Volatility Conviction",
+            Description = "Same judgment-adjusted caveat as the pre-window multiplier above applies here too.")]
+        public double OpexPostWindowRiskMultiplier { get; set; }
+
         [Parameter("Use EMA Trend Filter", DefaultValue = true, Group = "EMA Trend Filter",
             Description = "Same mechanism as the daily/weekly bots: EMA Fast above EMA Slow = bullish, Slow above Fast = bearish, checked across up to 7 independent timeframes, requiring Minimum Timeframes Agreeing of them to agree before it counts as a direction.")]
         public bool UseEmaTrendFilter { get; set; }
@@ -314,6 +364,9 @@ namespace cAlgo.Robots
         private bool _standDownForBadGammaData; // monthly/weekly overlap or degenerate (call_wall == put_wall) data
         private DateTime? _lastSweepDate; // local calendar date (SessionTimeZoneId) the weekly sweep last ran on
 
+        private bool _isBackwardation; // near-term ATM IV > far-term ATM IV, refreshed once per day
+        private DateTime? _lastTermStructureCheckDate;
+
         // ---------------------------------------------------------------------------------------------
         // Lifecycle
         // ---------------------------------------------------------------------------------------------
@@ -359,10 +412,16 @@ namespace cAlgo.Robots
             Positions.Closed += OnPositionsClosed;
 
             RefreshGammaLevels(); // get an initial read before waiting for the first timer tick
+            DateTime startLocalDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
             if (RunWeeklySweep)
             {
                 RunWeeklyGammaSweep();
-                _lastSweepDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
+                _lastSweepDate = startLocalDate;
+            }
+            if (UseVolatilityConviction)
+            {
+                RefreshVolatilityTermStructure();
+                _lastTermStructureCheckDate = startLocalDate;
             }
             Timer.Start(TimeSpan.FromMinutes(GammaRefreshMinutes));
         }
@@ -391,14 +450,18 @@ namespace cAlgo.Robots
 
             if (dueForRefresh) RefreshGammaLevels();
 
-            if (RunWeeklySweep)
+            DateTime tickLocalDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
+
+            if (RunWeeklySweep && (_lastSweepDate == null || tickLocalDate != _lastSweepDate.Value))
             {
-                DateTime localDate = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _sessionTz).Date;
-                if (_lastSweepDate == null || localDate != _lastSweepDate.Value)
-                {
-                    RunWeeklyGammaSweep();
-                    _lastSweepDate = localDate;
-                }
+                RunWeeklyGammaSweep();
+                _lastSweepDate = tickLocalDate;
+            }
+
+            if (UseVolatilityConviction && (_lastTermStructureCheckDate == null || tickLocalDate != _lastTermStructureCheckDate.Value))
+            {
+                RefreshVolatilityTermStructure();
+                _lastTermStructureCheckDate = tickLocalDate;
             }
         }
 
@@ -860,6 +923,148 @@ namespace cAlgo.Robots
             }
         }
 
+        // ---------------------------------------------------------------------------------------------
+        // Volatility Conviction - IV term structure (checked once per day, see OnTimer)
+        // ---------------------------------------------------------------------------------------------
+
+        // Average implied vol of the few contracts nearest the money - a simple, robust ATM IV proxy.
+        // Reuses the same ImpliedVol() inversion already validated for Gamma Flip (rather than trusting
+        // optioncharts' own published IV numbers, which were confirmed elsewhere in this file's history to
+        // include unstable/illiquid quotes that self-inverted IV naturally filters out via non-convergence).
+        private double GetAtmImpliedVol(List<ChainLeg> legs, double spot, double expirationUnix, double nowUnix)
+        {
+            double T = (expirationUnix - nowUnix) / (365.25 * 86400.0);
+            if (T <= 0) return double.NaN;
+
+            var candidates = legs
+                .Select(l => new { l, dist = Math.Abs(l.Strike - spot) })
+                .OrderBy(x => x.dist)
+                .Take(6)
+                .Select(x => x.l);
+
+            var ivs = new List<double>();
+            foreach (var leg in candidates)
+            {
+                double mid = (leg.Bid + leg.Ask) / 2.0;
+                double sigma = ImpliedVol(mid, spot, leg.Strike, RiskFreeRate, DividendYield, T, leg.IsCall);
+                if (!double.IsNaN(sigma) && sigma > 0.001 && sigma < 4.9) ivs.Add(sigma);
+            }
+            return ivs.Count > 0 ? ivs.Average() : double.NaN;
+        }
+
+        // Runs once per calendar day (see OnTimer). Compares near-term ATM IV (the same default/nearest
+        // expiration RefreshGammaLevels trades off) against a far-term expiration near Far-Term Expiration
+        // Target days out, picked from whatever's actually listed rather than assumed.
+        private void RefreshVolatilityTermStructure()
+        {
+            try
+            {
+                string nearGexHtml = _http.GetStringAsync(BuildGammaExposureUrl(GammaExpirationOverride)).Result;
+                var (_, _, nearExpirationId, nearExpirationUnix) = ParseGammaExposureHtml(nearGexHtml);
+                if (nearExpirationId == null) { Print("[IV] Could not resolve near-term expiration - skipping term structure check."); return; }
+
+                string nearChainHtml = _http.GetStringAsync(BuildOptionChainUrl(nearExpirationId)).Result;
+                var (nearSpot, nearLegs) = ParseOptionChainHtml(nearChainHtml);
+                if (double.IsNaN(nearSpot) || nearLegs.Count == 0) { Print("[IV] Near-term chain had no usable contracts - skipping term structure check."); return; }
+
+                double nowUnix = (Server.TimeInUtc - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                double nearIv = GetAtmImpliedVol(nearLegs, nearSpot, nearExpirationUnix, nowUnix);
+
+                var upcoming = DiscoverUpcomingExpirations(FarTermExpirationDaysTarget + 15);
+                if (upcoming.Count == 0) { Print("[IV] No upcoming expirations discovered for far-term comparison - skipping."); return; }
+
+                DateTime today = Server.TimeInUtc.Date;
+                var farPick = upcoming.OrderBy(e => Math.Abs((e.date - today).Days - FarTermExpirationDaysTarget)).First();
+
+                string farGexHtml = _http.GetStringAsync(BuildGammaExposureUrl(farPick.expirationId)).Result;
+                var (_, _, farExpirationId, farExpirationUnix) = ParseGammaExposureHtml(farGexHtml);
+                if (farExpirationId == null) { Print($"[IV] Could not resolve far-term expiration '{farPick.expirationId}' - skipping."); return; }
+
+                string farChainHtml = _http.GetStringAsync(BuildOptionChainUrl(farExpirationId)).Result;
+                var (farSpot, farLegs) = ParseOptionChainHtml(farChainHtml);
+                if (double.IsNaN(farSpot) || farLegs.Count == 0) { Print("[IV] Far-term chain had no usable contracts - skipping."); return; }
+
+                double farIv = GetAtmImpliedVol(farLegs, farSpot, farExpirationUnix, nowUnix);
+
+                if (double.IsNaN(nearIv) || double.IsNaN(farIv))
+                {
+                    Print("[IV] Could not compute a usable ATM IV on one or both sides - leaving previous backwardation state unchanged.");
+                    return;
+                }
+
+                _isBackwardation = nearIv > farIv;
+                Print($"[IV] Term structure: near({nearExpirationId})={nearIv * 100:F2}% far({farExpirationId}, ~{(farPick.date - today).Days}d)={farIv * 100:F2}% -> {(_isBackwardation ? "BACKWARDATION (elevated near-term risk)" : "normal/contango")}");
+            }
+            catch (Exception ex)
+            {
+                Print($"[IV] Term structure check failed ({ex.Message}) - leaving previous backwardation state unchanged.");
+            }
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Volatility Conviction - monthly OPEX cycle (pure date math, no fetch needed)
+        // ---------------------------------------------------------------------------------------------
+
+        private static DateTime ThirdFridayOfMonth(int year, int month)
+        {
+            DateTime d = new DateTime(year, month, 1);
+            int fridaysSeen = 0;
+            while (true)
+            {
+                if (d.DayOfWeek == DayOfWeek.Friday)
+                {
+                    fridaysSeen++;
+                    if (fridaysSeen == 3) return d;
+                }
+                d = d.AddDays(1);
+            }
+        }
+
+        // Fade-trade-only multiplier: boosted in the real, measured pinned window before monthly OPEX,
+        // reduced in the real, measured just-released window after it, neutral otherwise. Confirmed this
+        // does NOT generalize to weekly (Friday) expirations at 4x the sample size, so deliberately scoped
+        // to monthly (3rd Friday) OPEX only - see the header comment above the parameter group.
+        private double GetOpexFadeConvictionMultiplier(DateTime localDate)
+        {
+            DateTime thisMonthOpex = ThirdFridayOfMonth(localDate.Year, localDate.Month);
+            DateTime lastMonth = localDate.AddMonths(-1);
+            DateTime lastMonthOpex = ThirdFridayOfMonth(lastMonth.Year, lastMonth.Month);
+            DateTime nextMonth = localDate.AddMonths(1);
+            DateTime nextMonthOpex = ThirdFridayOfMonth(nextMonth.Year, nextMonth.Month);
+
+            DateTime mostRecentOpex = localDate >= thisMonthOpex ? thisMonthOpex : lastMonthOpex;
+            DateTime upcomingOpex = localDate < thisMonthOpex ? thisMonthOpex : nextMonthOpex;
+
+            int tradingDaysSincePastOpex = CountTradingDays(mostRecentOpex, localDate);
+            int tradingDaysUntilNextOpex = CountTradingDays(localDate, upcomingOpex);
+
+            if (tradingDaysSincePastOpex >= 0 && tradingDaysSincePastOpex <= OpexPostWindowTradingDays)
+                return OpexPostWindowRiskMultiplier;
+            if (tradingDaysUntilNextOpex >= 0 && tradingDaysUntilNextOpex <= OpexPreWindowTradingDays)
+                return OpexPreWindowRiskMultiplier;
+            return 1.0;
+        }
+
+        private static int CountTradingDays(DateTime from, DateTime to)
+        {
+            int count = 0;
+            for (DateTime d = from.Date; d < to.Date; d = d.AddDays(1))
+                if (d.DayOfWeek != DayOfWeek.Saturday && d.DayOfWeek != DayOfWeek.Sunday) count++;
+            return count;
+        }
+
+        // Combined risk-% multiplier: backwardation applies to both trade types, the OPEX cycle multiplier
+        // applies to fade trades only (see the parameter group header for why).
+        private double GetConvictionRiskMultiplier(bool isFadeTrade, DateTime localDate)
+        {
+            if (!UseVolatilityConviction) return 1.0;
+
+            double multiplier = _isBackwardation ? BackwardationRiskMultiplier : 1.0;
+            if (isFadeTrade)
+                multiplier *= GetOpexFadeConvictionMultiplier(localDate);
+            return multiplier;
+        }
+
         private static double NormalCdf(double x)
         {
             double t = 1.0 / (1.0 + 0.2316419 * Math.Abs(x));
@@ -1058,14 +1263,17 @@ namespace cAlgo.Robots
             double distCallPct = Math.Abs(xBar.Close - _gamma.CallWall) / _gamma.CallWall * 100.0;
             double distPutPct = Math.Abs(xBar.Close - _gamma.PutWall) / _gamma.PutWall * 100.0;
 
+            DateTime localDate = TimeZoneInfo.ConvertTimeFromUtc(xBar.OpenTime, _sessionTz).Date;
+            double riskMult = GetConvictionRiskMultiplier(isFadeTrade: true, localDate);
+
             if (emaBias == "short" && EnableShorts && distCallPct <= EntryProximityToWallPercent)
             {
                 double stop = _gamma.CallWall * (1 + StopBufferPercent / 100.0);
                 double target = _gamma.GammaFlip;
                 if (!PassesRewardRisk(xBar.Close, stop, target, TradeType.Sell)) return;
 
-                string reason = $"Positive gamma FADE SHORT at Call Wall {_gamma.CallWall:F2} (within {distCallPct:F3}%), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})";
-                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime);
+                string reason = $"Positive gamma FADE SHORT at Call Wall {_gamma.CallWall:F2} (within {distCallPct:F3}%), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime, riskMult);
             }
             else if (emaBias == "long" && EnableLongs && distPutPct <= EntryProximityToWallPercent)
             {
@@ -1073,8 +1281,8 @@ namespace cAlgo.Robots
                 double target = _gamma.GammaFlip;
                 if (!PassesRewardRisk(xBar.Close, stop, target, TradeType.Buy)) return;
 
-                string reason = $"Positive gamma FADE LONG at Put Wall {_gamma.PutWall:F2} (within {distPutPct:F3}%), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})";
-                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime);
+                string reason = $"Positive gamma FADE LONG at Put Wall {_gamma.PutWall:F2} (within {distPutPct:F3}%), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime, riskMult);
             }
         }
 
@@ -1084,25 +1292,33 @@ namespace cAlgo.Robots
             bool putWallBroke = xBar.Close < _gamma.PutWall * (1 - WallBreakBufferPercent / 100.0);
             bool callWallBroke = xBar.Close > _gamma.CallWall * (1 + WallBreakBufferPercent / 100.0);
 
+            // Negative gamma measured ~1.54x bigger next-day moves than positive gamma in real NDX data -
+            // widen the stop (and therefore the R:R-derived target) proportionally rather than sizing a
+            // breakout trade's risk the same as a calmer-regime trade.
+            double stopBuf = UseVolatilityConviction ? StopBufferPercent * NegativeGammaStopWidenFactor : StopBufferPercent;
+            double riskMult = GetConvictionRiskMultiplier(isFadeTrade: false, TimeZoneInfo.ConvertTimeFromUtc(xBar.OpenTime, _sessionTz).Date);
+
             if (emaBias == "short" && EnableShorts && putWallBroke)
             {
-                double stop = _gamma.PutWall * (1 + StopBufferPercent / 100.0);
+                double stop = _gamma.PutWall * (1 + stopBuf / 100.0);
                 double stopDist = stop - xBar.Close;
                 double target = xBar.Close - stopDist * BreakoutRewardToRiskRatio;
 
-                string reason = $"Negative gamma BREAKDOWN SHORT - Put Wall {_gamma.PutWall:F2} failed to hold, target {target:F2} ({BreakoutRewardToRiskRatio:F1}R), {emaBias.ToUpper()} EMA agrees";
-                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime);
+                string reason = $"Negative gamma BREAKDOWN SHORT - Put Wall {_gamma.PutWall:F2} failed to hold, target {target:F2} ({BreakoutRewardToRiskRatio:F1}R, stop widened {NegativeGammaStopWidenFactor:F2}x), {emaBias.ToUpper()} EMA agrees" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime, riskMult);
             }
             else if (emaBias == "long" && EnableLongs && callWallBroke)
             {
-                double stop = _gamma.CallWall * (1 - StopBufferPercent / 100.0);
+                double stop = _gamma.CallWall * (1 - stopBuf / 100.0);
                 double stopDist = xBar.Close - stop;
                 double target = xBar.Close + stopDist * BreakoutRewardToRiskRatio;
 
-                string reason = $"Negative gamma BREAKOUT LONG - Call Wall {_gamma.CallWall:F2} failed to hold, target {target:F2} ({BreakoutRewardToRiskRatio:F1}R), {emaBias.ToUpper()} EMA agrees";
-                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime);
+                string reason = $"Negative gamma BREAKOUT LONG - Call Wall {_gamma.CallWall:F2} failed to hold, target {target:F2} ({BreakoutRewardToRiskRatio:F1}R, stop widened {NegativeGammaStopWidenFactor:F2}x), {emaBias.ToUpper()} EMA agrees" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime, riskMult);
             }
         }
+
+        private string ConvictionSuffix(double riskMult) => Math.Abs(riskMult - 1.0) > 0.001 ? $" [conviction risk x{riskMult:F2}]" : "";
 
         private string emaReasonShort(string bias) => bias == "long" ? "bullish confluence" : "bearish confluence";
 
@@ -1124,12 +1340,12 @@ namespace cAlgo.Robots
         // Position management
         // ---------------------------------------------------------------------------------------------
 
-        private void OpenPosition(TradeType type, Bar xBar, string reason, double stopPrice, double targetPrice, string regime)
+        private void OpenPosition(TradeType type, Bar xBar, string reason, double stopPrice, double targetPrice, string regime, double riskMultiplier = 1.0)
         {
             double estEntry = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
             double stopDistance = Math.Abs(estEntry - stopPrice);
 
-            double volumeInUnits = CalculateVolume(stopDistance);
+            double volumeInUnits = CalculateVolume(stopDistance, riskMultiplier);
 
             var result = ExecuteMarketOrder(type, SymbolName, volumeInUnits, PositionLabel, null, null, reason);
 
@@ -1151,11 +1367,11 @@ namespace cAlgo.Robots
                 DrawReasonLabel(reason, xBar.OpenTime, type == TradeType.Buy ? xBar.Low : xBar.High, type == TradeType.Buy, Color.LimeGreen);
         }
 
-        private double CalculateVolume(double stopDistance)
+        private double CalculateVolume(double stopDistance, double riskMultiplier = 1.0)
         {
             if (stopDistance <= 0) return Symbol.NormalizeVolumeInUnits(Symbol.QuantityToVolumeInUnits(FallbackVolumeLots));
 
-            double riskAmount = Account.FreeMargin * RiskPercent / 100.0;
+            double riskAmount = Account.FreeMargin * (RiskPercent * riskMultiplier) / 100.0;
             double pips = stopDistance / Symbol.PipSize;
             double riskPerLot = pips * Symbol.PipValue;
             if (riskPerLot <= 0) return Symbol.VolumeInUnitsMin;

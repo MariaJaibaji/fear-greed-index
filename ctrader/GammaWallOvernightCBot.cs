@@ -357,7 +357,7 @@ namespace cAlgo.Robots
             Description = "Prints one diagnostic line per Locked Execution Timeframe bar: current gamma levels/age, regime, EMA confluence state, and distance to each wall.")]
         public bool EnableDebugLogging { get; set; }
 
-        [Parameter("Locked Execution Timeframe", DefaultValue = "Minute1", Group = "Strategy")]
+        [Parameter("Locked Execution Timeframe", DefaultValue = "Minute", Group = "Strategy")]
         public TimeFrame ExecutionTimeFrame { get; set; }
 
         // ---------------------------------------------------------------------------------------------

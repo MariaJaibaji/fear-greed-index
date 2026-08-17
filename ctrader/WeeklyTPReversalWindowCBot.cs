@@ -285,7 +285,7 @@ namespace cAlgo.Robots
             Description = "On = evaluate entries/exits/window off a fixed timeframe below, so changing the chart timeframe doesn't change results. Off = evaluate on every tick using this chart's own bars. Only applies in single-symbol mode (Traded Symbols blank) - multi-symbol mode always evaluates each symbol off its own Locked Execution Timeframe bars, since only this chart's own ticks are available to drive an 'unlocked' per-tick evaluation.")]
         public bool LockExecutionTimeframe { get; set; }
 
-        [Parameter("Locked Execution Timeframe", DefaultValue = "Minute1", Group = "Strategy")]
+        [Parameter("Locked Execution Timeframe", DefaultValue = "Minute", Group = "Strategy")]
         public TimeFrame ExecutionTimeFrame { get; set; }
 
         // ---------------------------------------------------------------------------------------------

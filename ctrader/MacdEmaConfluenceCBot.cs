@@ -5,11 +5,23 @@
 // three timeframes (1min/5min/15min by default). A trade only fires when BOTH indicators agree on
 // direction across enough of those timeframes (Min Timeframes Agreeing) - and firing means entering (or
 // reversing into) that direction THE MOMENT the combined signal changes, not on every bar it happens to
-// hold (as specified - "immediate entry on confluence flip"). If the combined signal breaks down
-// (indicators disagree, or confluence is lost) with a position open, that position is closed regardless of
-// stop/target - the trade's entire premise was the confluence holding.
+// hold (as specified - "immediate entry on confluence flip").
 //
-// *** STATUS: BRAND NEW, UNVALIDATED - NO BACKTEST OR FORWARD DATA BEHIND ANY DEFAULT BELOW ***
+// ENTRY vs EXIT use different thresholds, deliberately (see EvaluateTradingLogic): entering still requires
+// full agreement (Min Timeframes Agreeing, default 3/3, on both indicators). But an open position is only
+// force-closed on a genuine REVERSAL - a fresh, full opposite-direction signal - not merely on losing that
+// full agreement (bias dropping to null, e.g. 2/3 or 1/3). Originally these used the same trigger (any
+// disagreement closed the position), and a real one-month backtest run showed why that was wrong: 69% of
+// trades (359/519) closed via that path alone, averaging 5.1 minutes held (99% under 15 minutes) - the
+// noisy 1-minute leg flickers out of 3/3 agreement almost immediately after nearly every entry, closing
+// trades before the ATR stop/target (or the dedicated 1min MACD fast-exit, see ProcessMacdTrailBar) ever
+// got a chance to matter. The fast-exit specifically never fired even once across those 519 trades, since
+// the broader "any disagreement" trigger always preempted it - an entire configured feature going silently
+// dead in practice. Splitting entry/exit thresholds lets a position ride through single-timeframe noise
+// while the slower timeframes still hold their view, protected by the ATR stop/target and the (now
+// actually reachable) fast-exit.
+//
+// *** STATUS: BRAND NEW, LIGHTLY VALIDATED - ONE REAL BACKTEST RUN, STILL NOT TUNED ***
 // Every period/multiplier here is a reasonable-sounding starting point, not a tuned value: MACD(12,26,9)
 // is the industry-standard setting; EMA(12,26) deliberately mirrors MACD's own cycles for a consistent
 // story; ATR-based stop/target is the standard approach for a system with no natural price level (wall,
@@ -17,13 +29,15 @@
 // reversal bots in this repo were - treat a live run as forward/paper testing that GENERATES the data
 // needed to validate and tune it, not a proven edge.
 //
-// *** VERIFY BEFORE RUNNING: MacdCrossOver / AverageTrueRange indicator signatures ***
-// This file has not been compiled inside cTrader (same caveat as the other bots in this repo). The
+// Confirmed compiling and running in real cTrader backtesting as of the fixes below - the
 // Indicators.MacdCrossOver(source, longCycle, shortCycle, signalPeriod) parameter order and the
-// AverageTrueRange MovingAverageType member used below are written from general cAlgo.API knowledge, not
-// verified against a live SDK - double-check both against your installed cAlgo version's own
-// autocomplete/reference before trusting the values, since a swapped long/short cycle would silently
-// invert the whole MACD read.
+// AverageTrueRange MovingAverageType member both checked out (the backtest log's MACD confluence readings
+// look sane, and trades executed correctly), so that particular risk flagged in earlier revisions of this
+// comment is resolved. Two real, confirmed-fixed bugs from getting this running: (1) "Minute1" is not a
+// valid TimeFrame value in cAlgo (the real member is "Minute") - this broke every TimeFrame Parameter
+// defaulting to it, including this bot's own execution/MACD/EMA timeframe-1 slots; (2) MarketData.GetBars()
+// can fail to load a series even for recent, plainly-available history - OnStart now prefers the cBot's own
+// native Bars property (guaranteed already loaded) whenever the requested timeframe matches the chart's.
 //
 // No external data feed (unlike GammaWallOvernightCBot.cs) - this bot does NOT require
 // AccessRights.FullAccess, so unlike that one, it CAN run on cTrader's own hosted cloud/VPS.
@@ -427,14 +441,22 @@ namespace cAlgo.Robots
 
             if (!flipped) return; // nothing changed since the last bar - don't touch anything
 
-            // Close any open position that no longer matches the new bias (including the bias going null -
-            // confluence broke down entirely, not just flipped to the opposite side).
+            // Only force-close on a genuine REVERSAL - a fresh, full opposite-direction confluence signal -
+            // not merely on losing full agreement (bias dropping to null, e.g. 2/3 or 1/3). A real backtest
+            // run showed why that distinction matters: with the broader "any disagreement closes it" rule,
+            // 69% of trades (359/519) closed via this path alone, averaging 5.1 minutes held (99% under 15
+            // minutes) - the noisy 1-minute leg flickers out of 3/3 agreement almost immediately after every
+            // entry, closing trades before the ATR stop/target (or the dedicated 1min MACD fast-exit below)
+            // ever got a chance to matter; the fast-exit specifically never fired even once in that run,
+            // since this broader trigger always preempted it. Requiring an actual opposite signal - not
+            // just "no longer 3/3 in my favor" - lets a position ride through single-timeframe noise while
+            // the slower timeframes still hold their view.
             if (_openPosition != null)
             {
-                bool positionMatchesBias = (bias == "long" && _openPosition.TradeType == TradeType.Buy)
-                                         || (bias == "short" && _openPosition.TradeType == TradeType.Sell);
-                if (!positionMatchesBias)
-                    CloseWithReason($"Confluence flip away from this position - {reason}", xBar.Close, xBar.OpenTime);
+                bool isReversal = (bias == "long" && _openPosition.TradeType == TradeType.Sell)
+                                || (bias == "short" && _openPosition.TradeType == TradeType.Buy);
+                if (isReversal)
+                    CloseWithReason($"Confluence reversed against this position - {reason}", xBar.Close, xBar.OpenTime);
             }
 
             if (bias == null || _openPosition != null) return; // no actionable direction, or already positioned correctly

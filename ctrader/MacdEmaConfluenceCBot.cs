@@ -209,13 +209,46 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
+            try
+            {
+                _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
+            }
+            catch (Exception ex)
+            {
+                Print($"FATAL: Exception loading {SymbolName} {ExecutionTimeFrame} bars ({ex.Message}).");
+            }
+            if (_execBars == null)
+            {
+                // Seen in practice: a broker/backtest data feed without {Symbol, Timeframe} history that
+                // far back returns null here (with its own "Failed to load symbol data" error logged just
+                // before this) rather than throwing - this bot has nothing to run on without its execution
+                // bars, so stop cleanly instead of a raw NullReferenceException on the next line.
+                Print($"FATAL: Could not load {SymbolName} {ExecutionTimeFrame} bars - most likely no history at this timeframe/range for this symbol on this feed (common for M1 going back further than a broker keeps). This bot cannot run without it; stopping. Try a more recent backtest range, or a coarser Locked Execution Timeframe if M1 specifically is the problem.");
+                Stop();
+                return;
+            }
             _execBars.BarOpened += OnExecBarOpened;
             _atr = Indicators.AverageTrueRange(_execBars, AtrPeriod, MovingAverageType.Simple);
 
-            _macdTrailBars = MarketData.GetBars(TimeFrame.Minute, SymbolName);
-            _macdTrailBars.BarOpened += OnMacdTrailBarOpened;
-            _macdTrail = Indicators.MacdCrossOver(_macdTrailBars.ClosePrices, MacdSlowPeriod, MacdFastPeriod, MacdSignalPeriod);
+            try
+            {
+                _macdTrailBars = MarketData.GetBars(TimeFrame.Minute, SymbolName);
+            }
+            catch (Exception ex)
+            {
+                Print($"Warning: Exception loading {SymbolName} 1-minute bars for the MACD trailing-stop/fast-exit mechanism ({ex.Message}).");
+            }
+            if (_macdTrailBars == null)
+            {
+                // Non-fatal - only the 1min trail/fast-exit mechanism depends on this, not the core
+                // MACD+EMA confluence entries or the ATR stop/target.
+                Print("Warning: Could not load 1-minute bars for the MACD trailing-stop/fast-exit mechanism (see file header) - most likely no M1 history available for this symbol/range. That feature is disabled for this run; MACD/EMA confluence entries and the ATR stop/target still work normally.");
+            }
+            else
+            {
+                _macdTrailBars.BarOpened += OnMacdTrailBarOpened;
+                _macdTrail = Indicators.MacdCrossOver(_macdTrailBars.ClosePrices, MacdSlowPeriod, MacdFastPeriod, MacdSignalPeriod);
+            }
 
             if (UseMacdFilter)
             {

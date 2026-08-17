@@ -213,7 +213,7 @@ namespace cAlgo.Robots
             _execBars.BarOpened += OnExecBarOpened;
             _atr = Indicators.AverageTrueRange(_execBars, AtrPeriod, MovingAverageType.Simple);
 
-            _macdTrailBars = MarketData.GetBars(TimeFrame.Minute1, SymbolName);
+            _macdTrailBars = MarketData.GetBars(TimeFrame.Minute, SymbolName);
             _macdTrailBars.BarOpened += OnMacdTrailBarOpened;
             _macdTrail = Indicators.MacdCrossOver(_macdTrailBars.ClosePrices, MacdSlowPeriod, MacdFastPeriod, MacdSignalPeriod);
 

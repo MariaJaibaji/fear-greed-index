@@ -38,6 +38,20 @@
 // turns out to be the wrong tradeoff in practice, resetting _lastCombinedBias to null in OnPositionsClosed
 // would make it re-enter immediately instead.
 //
+// 1min MACD trailing stop / fast exit (see ProcessMacdTrailBar): independent of the ATR stop above, a
+// dedicated 1-minute-only MACD (separate from the parameterized MACD Timeframe 1-3 slots, which could be
+// set to something else) is watched for its OWN crossovers on every 1-minute bar close, regardless of
+// Locked Execution Timeframe. A crossover AGAINST the open position's direction closes it immediately -
+// tighter and faster than waiting for the full 3-TF combined bias to flip. A crossover WITH the position's
+// direction (continued momentum after a shallow pullback) trails the stop to that crossover candle's low
+// (longs) / high (shorts), only ever tightening it, never loosening it - starts disengaged at entry and
+// first activates on the FIRST such crossover after entry, so the ATR stop protects the trade until then.
+//
+// Cooldown After Close (minutes) applies uniformly after ANY close, including an immediate stop-and-
+// reverse on a fresh confluence flip - same precedent as the cooldown in GammaWallOvernightCBot.cs. This
+// deliberately softens the "immediate entry on flip" behavior specified earlier in favor of whipsaw
+// protection; set it to 0 if instant reversal is what you actually want back.
+//
 // EMA trend-filter mechanism, risk-% position sizing, and general parameter/state/logging conventions are
 // deliberately similar to the other bots in this repo for consistency, adapted down from 7 timeframes to
 // the 3 specified here.
@@ -114,6 +128,14 @@ namespace cAlgo.Robots
             Description = "Target distance = stop distance x this multiple, same reasoning as the breakout trades in GammaWallOvernightCBot.cs - there's no natural target level here either.")]
         public double RewardToRiskRatio { get; set; }
 
+        [Parameter("Use 1min MACD Trailing Stop", DefaultValue = true, Group = "Risk Management",
+            Description = "On top of the initial ATR stop: tracks the 1-minute MACD independently of the MACD Timeframe 1-3 slots above (always literally 1 minute, regardless of how those are configured), and every time it produces a NEW crossover in the position's OWN direction (a sign of continued momentum, e.g. a shallow pullback-and-resume), moves the stop to that crossover candle's low (longs) / high (shorts), buffered by MACD Trail Buffer %. Only ever tightens the stop, never loosens it. See the file header for what the paired opposite-direction case does.")]
+        public bool UseMacdTrailingStop { get; set; }
+
+        [Parameter("MACD Trail Buffer %", DefaultValue = 0.05, MinValue = 0, Group = "Risk Management",
+            Description = "Small buffer beyond the 1min MACD crossover candle's low/high the trailing stop is placed at, so it isn't sitting exactly on the level.")]
+        public double MacdTrailBufferPercent { get; set; }
+
         [Parameter("Risk % Of Free Margin Per Trade", DefaultValue = 1.0, MinValue = 0.01, Group = "Risk Management")]
         public double RiskPercent { get; set; }
 
@@ -140,6 +162,10 @@ namespace cAlgo.Robots
             Description = "Drives when EvaluateTradingLogic runs (once per bar close on this timeframe) and which bars the ATR stop/target is computed from - independent of the MACD/EMA timeframes above.")]
         public TimeFrame ExecutionTimeFrame { get; set; }
 
+        [Parameter("Cooldown After Close (minutes)", DefaultValue = 5, MinValue = 0, Group = "Strategy",
+            Description = "Minimum time after ANY position close - a confluence flip/breakdown, the 1min-MACD opposite-flip exit, a stop, or a target - before a new entry is allowed. Applies uniformly, INCLUDING an immediate stop-and-reverse on a fresh confluence flip (same precedent as the cooldown in GammaWallOvernightCBot.cs) - this deliberately softens the 'immediate entry on flip' behavior in exchange for whipsaw protection. Set to 0 to fully restore instant reversal.")]
+        public int CooldownMinutes { get; set; }
+
         // ---------------------------------------------------------------------------------------------
         // State
         // ---------------------------------------------------------------------------------------------
@@ -155,6 +181,15 @@ namespace cAlgo.Robots
         private ExponentialMovingAverage _emaFast2, _emaSlow2;
         private ExponentialMovingAverage _emaFast3, _emaSlow3;
 
+        // Dedicated 1-minute MACD, independent of the MACD Timeframe 1-3 slots (which are parameterized
+        // and could point elsewhere) - always literally 1 minute, for the trailing stop / fast-exit
+        // mechanism described in the file header. Fires on its own BarOpened subscription rather than
+        // piggybacking on OnExecBarOpened, so it stays truly 1-minute-responsive even if Locked Execution
+        // Timeframe is changed away from Minute1.
+        private Bars _macdTrailBars;
+        private MacdCrossOver _macdTrail;
+        private string _macdTrailLastState; // previous 1min bar's MACD state ("long"/"short"/null) - for edge (crossover) detection, not just current state
+
         private Position _openPosition;
         private double _entryPrice;
         private int _objCounter;
@@ -165,6 +200,9 @@ namespace cAlgo.Robots
         // stop/target hit means in practice.
         private string _lastCombinedBias;
 
+        // Timestamp of the most recent position close, of any kind - see Cooldown After Close (minutes).
+        private DateTime? _lastCloseUtc;
+
         // ---------------------------------------------------------------------------------------------
         // Lifecycle
         // ---------------------------------------------------------------------------------------------
@@ -174,6 +212,10 @@ namespace cAlgo.Robots
             _execBars = MarketData.GetBars(ExecutionTimeFrame, SymbolName);
             _execBars.BarOpened += OnExecBarOpened;
             _atr = Indicators.AverageTrueRange(_execBars, AtrPeriod, MovingAverageType.Simple);
+
+            _macdTrailBars = MarketData.GetBars(TimeFrame.Minute1, SymbolName);
+            _macdTrailBars.BarOpened += OnMacdTrailBarOpened;
+            _macdTrail = Indicators.MacdCrossOver(_macdTrailBars.ClosePrices, MacdSlowPeriod, MacdFastPeriod, MacdSignalPeriod);
 
             if (UseMacdFilter)
             {
@@ -210,6 +252,7 @@ namespace cAlgo.Robots
         protected override void OnStop()
         {
             if (_execBars != null) _execBars.BarOpened -= OnExecBarOpened;
+            if (_macdTrailBars != null) _macdTrailBars.BarOpened -= OnMacdTrailBarOpened;
             Positions.Closed -= OnPositionsClosed;
         }
 
@@ -359,7 +402,68 @@ namespace cAlgo.Robots
             if (bias == "long" && !EnableLongs) return;
             if (bias == "short" && !EnableShorts) return;
 
+            if (_lastCloseUtc != null && (Server.TimeInUtc - _lastCloseUtc.Value) < TimeSpan.FromMinutes(CooldownMinutes))
+            {
+                if (EnableDebugLogging) Print($"[DEBUG] Standing aside - cooldown after last close not yet elapsed ({(Server.TimeInUtc - _lastCloseUtc.Value).TotalSeconds:F0}s so far, need {CooldownMinutes * 60}s).");
+                return;
+            }
+
             OpenPosition(bias == "long" ? TradeType.Buy : TradeType.Sell, xBar, $"MACD+EMA confluence flip {bias.ToUpper()} - {reason}");
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // 1min MACD trailing stop / fast exit
+        // ---------------------------------------------------------------------------------------------
+
+        private void OnMacdTrailBarOpened(BarOpenedEventArgs args)
+        {
+            if (_macdTrailBars.Count < 2) return;
+            ProcessMacdTrailBar(_macdTrailBars.Last(1));
+        }
+
+        // Runs every 1-minute bar close, independent of Locked Execution Timeframe. Two effects on an open
+        // position, both keyed off the 1min MACD's OWN crossovers (edge-triggered, not just current state):
+        //   - A crossover AGAINST the position's direction closes it immediately - a faster, single-
+        //     timeframe early-warning exit than waiting for the full 3-TF combined bias to flip.
+        //   - A crossover WITH the position's direction (continued momentum) trails the stop to that
+        //     crossover candle's low (longs) / high (shorts), only ever tightening it.
+        // No position open -> nothing to manage, just keep the state tracker current for edge detection.
+        private void ProcessMacdTrailBar(Bar bar)
+        {
+            double m = _macdTrail.MACD.LastValue;
+            double s = _macdTrail.Signal.LastValue;
+            if (double.IsNaN(m) || double.IsNaN(s)) return;
+
+            string state = m >= s ? "long" : "short";
+            bool crossed = _macdTrailLastState != null && state != _macdTrailLastState;
+            _macdTrailLastState = state;
+
+            if (_openPosition == null || !crossed) return;
+
+            bool isLong = _openPosition.TradeType == TradeType.Buy;
+            bool sameDirection = (isLong && state == "long") || (!isLong && state == "short");
+
+            if (!sameDirection)
+            {
+                CloseWithReason($"1min MACD crossed {state.ToUpper()} against the open {(isLong ? "long" : "short")} - exiting on this flip as configured", bar.Close, bar.OpenTime);
+                return;
+            }
+
+            if (!UseMacdTrailingStop) return;
+
+            double rawLevel = isLong ? bar.Low : bar.High;
+            double candidate = isLong
+                ? rawLevel * (1 - MacdTrailBufferPercent / 100.0)
+                : rawLevel * (1 + MacdTrailBufferPercent / 100.0);
+
+            double? currentStop = _openPosition.StopLoss;
+            bool improves = currentStop == null
+                || (isLong && candidate > currentStop.Value)
+                || (!isLong && candidate < currentStop.Value);
+            if (!improves) return;
+
+            _openPosition.ModifyStopLossPrice(candidate);
+            Print($"[TRAIL] Stop trailed to {candidate:F2} (1min MACD same-direction crossover candle {bar.OpenTime:HH:mm}, {(isLong ? "low" : "high")}={rawLevel:F2}).");
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -431,6 +535,7 @@ namespace cAlgo.Robots
 
             ClosePosition(_openPosition);
             _openPosition = null;
+            _lastCloseUtc = Server.TimeInUtc;
         }
 
         private void OnPositionsClosed(PositionClosedEventArgs args)
@@ -447,7 +552,10 @@ namespace cAlgo.Robots
                 DrawReasonLabel(reason, Server.TimeInUtc, (args.Reason == PositionCloseReason.StopLoss ? args.Position.StopLoss : args.Position.TakeProfit) ?? 0, args.Position.TradeType != TradeType.Buy, args.Reason == PositionCloseReason.StopLoss ? Color.Red : Color.LimeGreen);
 
             if (_openPosition != null && _openPosition.Id == args.Position.Id)
+            {
                 _openPosition = null;
+                _lastCloseUtc = Server.TimeInUtc;
+            }
         }
 
         // ---------------------------------------------------------------------------------------------

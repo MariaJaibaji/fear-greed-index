@@ -41,25 +41,40 @@
 // IV includes illiquid/unstable far-strike quotes that this file's own inversion naturally rejects via
 // non-convergence. See ComputeGammaFlip for the full method.
 //
-// Strategy logic (as specified):
+// Strategy logic:
 //   - Regime = POSITIVE gamma whenever price is above Gamma Flip, NEGATIVE whenever below - re-evaluated
 //     fresh every bar from live price vs the flip level, not fixed once per session. If price crosses the
 //     flip mid-trade, the position's underlying regime premise has inverted and it is closed immediately
 //     (see EvaluateTradingLogic) rather than left to ride out its original stop/target blindly.
-//   - POSITIVE gamma (dealers long gamma -> hedging dampens volatility -> price tends to pin/mean-revert
-//     between the walls): fade the walls, but ONLY when the EMA confluence filter agrees with the fade
-//     direction - SHORT at the Call Wall when EMA reads bearish, LONG at the Put Wall when EMA reads
-//     bullish. Entry triggers when price comes within Entry Proximity To Wall % of the wall. Target is the
-//     Gamma Flip itself (the natural "center of gravity" in a pinned regime); stop is placed just beyond
-//     the wall being faded.
-//   - NEGATIVE gamma (dealers short gamma -> hedging AMPLIFIES moves -> breakouts tend to extend rather
-//     than revert): trade the wall FAILING to hold, not fading it - SHORT when the Put Wall breaks down
-//     (closes beyond it by Wall Break Buffer %) and EMA agrees bearish; LONG when the Call Wall breaks up
-//     and EMA agrees bullish (the call-wall-breaks-long case is the natural symmetric counterpart to the
-//     put-wall-breaks-short case as specified - flagging this assumption since only the short side was
-//     spelled out explicitly). Stop is placed back inside the broken wall (a failed retest); target is a
-//     configurable reward:risk multiple of the stop distance, since there's no natural "next wall" to aim
-//     at without a third data point.
+//   - Regime alone does NOT gate which trade type is allowed anymore. "Positive gamma dampens / negative
+//     gamma amplifies" is a real statistical tilt in the checked data, not a law - a wall can genuinely
+//     break in positive gamma, and price can genuinely hold/pin at a wall in negative gamma. Both FADE and
+//     BREAKOUT setups are evaluated every bar (fade checked first); what actually gates each one is the
+//     wall's own confirmed ROLE, tracked bar-by-bar per wall (see UpdateWallRoles/WallRole): Untested ->
+//     Testing (price came within Entry Proximity To Wall %) -> Holding (it pulled back without closing
+//     beyond the wall - confirmed as real support/resistance) or Broken (closed beyond it by Wall Break
+//     Buffer %, and stays Broken for the rest of the session once it fails).
+//   - FADE: only taken against a wall that is NOT Broken - SHORT at the Call Wall when EMA reads bearish,
+//     LONG at the Put Wall when EMA reads bullish, triggered on proximity. Target is Gamma Flip; stop is
+//     placed just beyond the wall being faded.
+//   - BREAKOUT: only taken against a wall that IS Broken, and (by default, Require Wall Tested Before
+//     Breakout) was previously confirmed Holding before it broke - a wall that's never been tested hasn't
+//     actually demonstrated it was acting as a level at all, so a break of it is a weaker signal than a
+//     break of a wall that held once already. SHORT when the Put Wall breaks down and EMA agrees bearish;
+//     LONG when the Call Wall breaks up and EMA agrees bullish. Stop is placed back inside the broken wall
+//     (a failed retest); target is a configurable reward:risk multiple of the stop distance.
+//   - Regime still matters for SIZING, not gating: a trade firing in its natural regime (fade in positive
+//     gamma, breakout in negative gamma) gets full conviction; a trade firing OFF-regime (fade in negative
+//     gamma, breakout in positive gamma) gets Off-Regime Risk Multiplier applied on top, since the
+//     regime-magnitude tilt is still real even though it no longer blocks the trade outright. Similarly,
+//     the negative-gamma stop-widen factor (see Volatility Conviction) only applies when the trade is
+//     actually IN negative gamma, not just because Use Volatility Conviction is on.
+//   - Exit management, in addition to stop/target: Take Profit At Wall Touch closes a position outright
+//     the moment price reaches the wall ahead of it in the favorable direction (Call Wall for longs, Put
+//     Wall for shorts) - walls are the strongest a-priori levels this bot has, so a live touch is treated
+//     as a target reached. Wall Proximity Stop Tighten % moves the stop to breakeven once a profitable
+//     position's price is within that % of the same favorable-direction wall, ahead of an actual touch.
+//     See ManageWallProximityExit.
 //
 // Session: entries are only considered inside an Overnight Session window (Session Start -> Session End,
 // in Session Timezone) - the levels are frozen once the US options market closes, so this bot is meant to
@@ -187,8 +202,12 @@ namespace cAlgo.Robots
         public bool UseVolatilityConviction { get; set; }
 
         [Parameter("Negative Gamma Stop/Target Widen Factor", DefaultValue = 1.5, MinValue = 1.0, Group = "Volatility Conviction",
-            Description = "Multiplies Stop Buffer Beyond Wall % (and therefore the R:R-derived target distance too) for BREAKOUT trades only, since those only fire in negative gamma. Default 1.5 matches the real measured ratio (1.330%/0.865% = 1.54x) of next-day move size in negative vs positive gamma.")]
+            Description = "Multiplies Stop Buffer Beyond Wall % (and therefore the R:R-derived target distance too) for BREAKOUT trades that are actually firing IN negative gamma - gated on the live regime at entry, not just on a trade being a breakout, since breakouts can now also fire in positive gamma (see the Strategy logic header) and shouldn't get the negative-gamma-sized stop when the regime doesn't back that up. Default 1.5 matches the real measured ratio (1.330%/0.865% = 1.54x) of next-day move size in negative vs positive gamma.")]
         public double NegativeGammaStopWidenFactor { get; set; }
+
+        [Parameter("Off-Regime Risk Multiplier", DefaultValue = 0.6, MinValue = 0.05, MaxValue = 1.0, Group = "Volatility Conviction",
+            Description = "Applied when a trade fires in its NON-natural regime - a fade trade taken in negative gamma, or a breakout trade taken in positive gamma. Both are allowed now (a wall's confirmed Holding/Broken role gates the trade, not the regime label - see Strategy group), but the regime-magnitude tilt measured in real data (positive gamma dampens, negative amplifies) is still real, so an off-regime trade is sized down rather than given full conviction. Not empirically calibrated to a specific number - a judgment-adjusted haircut, same caveat as the OPEX multipliers below.")]
+        public double OffRegimeRiskMultiplier { get; set; }
 
         [Parameter("Far-Term Expiration Target (days out)", DefaultValue = 30, MinValue = 7, Group = "Volatility Conviction",
             Description = "How many calendar days out to look for the far-term IV comparison point (checked once per day, not every refresh - term structure doesn't move fast enough to need 5-minute freshness).")]
@@ -302,6 +321,18 @@ namespace cAlgo.Robots
             Description = "Fade trades: stop is placed this % beyond the wall being faded. Breakout trades: stop is placed this % beyond the broken wall, back on the side it broke from (a failed-retest stop).")]
         public double StopBufferPercent { get; set; }
 
+        [Parameter("Require Wall Tested Before Breakout", DefaultValue = true, Group = "Strategy",
+            Description = "A wall only counts as a valid breakout trigger if price previously approached it (within Entry Proximity To Wall %) and pulled back WITHOUT closing beyond it, at least once, before it finally broke (see UpdateWallRoles/WallRole - this is the 'EverHeld' flag). Off = trade any wall break immediately, including a first-touch gap straight through with no prior confirmation it was acting as a real level. On (default) is the more conservative reading of 'check if walls are support or resistance' - a never-tested wall hasn't actually demonstrated that role yet.")]
+        public bool RequireWallTestedBeforeBreakout { get; set; }
+
+        [Parameter("Wall Proximity Stop Tighten %", DefaultValue = 0.2, MinValue = 0, Group = "Strategy",
+            Description = "When an open position is in profit and price comes within this % of the wall ahead of it in the favorable direction (Call Wall for longs, Put Wall for shorts), the stop is moved to breakeven (entry price) if it isn't already better than that. Set to 0 to disable. See ManageWallProximityExit.")]
+        public double WallProximityStopTightenPercent { get; set; }
+
+        [Parameter("Take Profit At Wall Touch", DefaultValue = true, Group = "Strategy",
+            Description = "Closes the position outright the moment price reaches the wall ahead of it in the favorable direction (Call Wall for longs, Put Wall for shorts), regardless of the original stop/target - walls are the strongest a-priori levels this bot has, so a live touch is treated as a real target reached rather than waiting for the original R:R target/stop to eventually catch up. See ManageWallProximityExit.")]
+        public bool TakeProfitAtWallTouch { get; set; }
+
         [Parameter("Breakout Reward:Risk Ratio", DefaultValue = 2.0, MinValue = 0.1, Group = "Strategy",
             Description = "Negative-gamma breakout trades have no natural 'next wall' target, so the target is this multiple of the stop distance instead.")]
         public double BreakoutRewardToRiskRatio { get; set; }
@@ -359,6 +390,7 @@ namespace cAlgo.Robots
         private Position _openPosition;
         private double _entryPrice;
         private string _entryRegime; // "positive" or "negative" - the regime the open trade was entered under
+        private bool _entryIsFadeTrade; // true = fade, false = breakout - see ManageWallProximityExit for why this matters
         private int _objCounter;
 
         private bool _standDownForBadGammaData; // monthly/weekly overlap or degenerate (call_wall == put_wall) data
@@ -382,6 +414,22 @@ namespace cAlgo.Robots
         // thin-data days), which would otherwise churn repeatedly at real spread/slippage cost each time.
         private DateTime? _lastCloseUtc;
         private const int MinSecondsBetweenTrades = 300;
+
+        // Per-wall confirmed role, updated every bar off live price action (see UpdateWallRoles) - this is
+        // what actually gates fade vs breakout entries now, not the GEX regime label alone (see the
+        // Strategy logic section of the file header for why). Untested = never approached. Testing = price
+        // is currently within Entry Proximity To Wall % of it, outcome not yet resolved. Holding = it was
+        // tested and price pulled back without closing beyond it - confirmed as real support/resistance.
+        // Broken = price closed beyond it by Wall Break Buffer % - sticky for the rest of the session once
+        // it fails, even if price later comes back inside. EverHeld persists independently of the current
+        // role (a wall can go Holding -> later Broken - EverHeld still remembers it held at least once),
+        // used by Require Wall Tested Before Breakout to distinguish a break of a proven level from a
+        // straight-through break of a level that never demonstrated it mattered.
+        private enum WallRole { Untested, Testing, Holding, Broken }
+        private WallRole _callWallRole = WallRole.Untested;
+        private WallRole _putWallRole = WallRole.Untested;
+        private bool _callWallEverHeld;
+        private bool _putWallEverHeld;
 
         // ---------------------------------------------------------------------------------------------
         // Lifecycle
@@ -422,6 +470,9 @@ namespace cAlgo.Robots
             if (_openPosition != null)
             {
                 _entryPrice = _openPosition.EntryPrice;
+                // cAlgo doesn't persist custom fields on a Position, so a recovered position's fade/breakout
+                // origin is unknown here - _entryIsFadeTrade stays false (its default), which conservatively
+                // means ManageWallProximityExit skips wall-touch management for it rather than guessing.
                 Print("Recovered an existing open position on start: " + _openPosition.TradeType);
             }
 
@@ -586,7 +637,18 @@ namespace cAlgo.Robots
                     _standDownForBadGammaData = true;
                     return; // reason already logged by IsUnreliableGammaDay
                 }
-                if (isNewPinThisSession) _standDownForBadGammaData = false;
+                if (isNewPinThisSession)
+                {
+                    _standDownForBadGammaData = false;
+
+                    // Fresh session, fresh (frozen) levels - a wall's role earned against yesterday's
+                    // levels says nothing about today's, so reset all of it here rather than carrying it
+                    // forward.
+                    _callWallRole = WallRole.Untested;
+                    _putWallRole = WallRole.Untested;
+                    _callWallEverHeld = false;
+                    _putWallEverHeld = false;
+                }
 
                 string chainHtml = _http.GetStringAsync(BuildOptionChainUrl(expirationId)).Result;
                 var (spot, legs) = ParseOptionChainHtml(chainHtml);
@@ -1116,14 +1178,17 @@ namespace cAlgo.Robots
         }
 
         // Combined risk-% multiplier: backwardation applies to both trade types, the OPEX cycle multiplier
-        // applies to fade trades only (see the parameter group header for why).
-        private double GetConvictionRiskMultiplier(bool isFadeTrade, DateTime localDate)
+        // applies to fade trades only (see the parameter group header for why), and the off-regime haircut
+        // applies whenever a trade is firing outside its natural regime (see the Strategy logic header).
+        private double GetConvictionRiskMultiplier(bool isFadeTrade, bool isOffRegime, DateTime localDate)
         {
             if (!UseVolatilityConviction) return 1.0;
 
             double multiplier = _isBackwardation ? BackwardationRiskMultiplier : 1.0;
             if (isFadeTrade)
                 multiplier *= GetOpexFadeConvictionMultiplier(localDate);
+            if (isOffRegime)
+                multiplier *= OffRegimeRiskMultiplier;
             return multiplier;
         }
 
@@ -1258,6 +1323,52 @@ namespace cAlgo.Robots
         }
 
         // ---------------------------------------------------------------------------------------------
+        // Wall role tracking - support/resistance confirmation, independent of GEX regime
+        // ---------------------------------------------------------------------------------------------
+
+        private void UpdateWallRoles(Bar xBar)
+        {
+            UpdateOneWallRole(ref _callWallRole, ref _callWallEverHeld, xBar.Close, _gamma.CallWall, isCallWall: true);
+            UpdateOneWallRole(ref _putWallRole, ref _putWallEverHeld, xBar.Close, _gamma.PutWall, isCallWall: false);
+        }
+
+        // A wall being a "call wall" or "put wall" only describes where dealer gamma exposure peaks - it
+        // says nothing on its own about whether price will actually respect it. This turns live price
+        // action against the wall into an explicit, checkable role: Testing -> Holding (confirmed as real
+        // support/resistance) or Broken (confirmed as failed) - see the WallRole field comment for the full
+        // state machine.
+        private void UpdateOneWallRole(ref WallRole role, ref bool everHeld, double close, double wall, bool isCallWall)
+        {
+            if (double.IsNaN(wall) || wall <= 0) return;
+
+            bool broke = isCallWall
+                ? close > wall * (1 + WallBreakBufferPercent / 100.0)
+                : close < wall * (1 - WallBreakBufferPercent / 100.0);
+            if (broke)
+            {
+                if (role != WallRole.Broken)
+                    Print($"[WALL] {(isCallWall ? "Call" : "Put")} Wall {wall:F2} BROKE (close {close:F2}, everHeld={everHeld}).");
+                role = WallRole.Broken;
+                return;
+            }
+
+            if (role == WallRole.Broken) return; // sticky for the rest of the session once it fails
+
+            double distPct = Math.Abs(close - wall) / wall * 100.0;
+            if (distPct <= EntryProximityToWallPercent)
+            {
+                role = WallRole.Testing;
+            }
+            else if (role == WallRole.Testing)
+            {
+                // Was testing, pulled back away without ever closing beyond it - confirmed holding.
+                role = WallRole.Holding;
+                everHeld = true;
+                Print($"[WALL] {(isCallWall ? "Call" : "Put")} Wall {wall:F2} HELD (tested then pulled back, close {close:F2}).");
+            }
+        }
+
+        // ---------------------------------------------------------------------------------------------
         // Entry / exit orchestration
         // ---------------------------------------------------------------------------------------------
 
@@ -1295,12 +1406,18 @@ namespace cAlgo.Robots
             bool positiveGamma = xBar.Close > _gamma.GammaFlip;
             string regime = positiveGamma ? "positive" : "negative";
 
+            UpdateWallRoles(xBar); // keeps Holding/Broken state current for both entry gating and exit management below
+
             // Regime-flip safety exit: the theoretical basis for an open trade (dampening vs amplifying)
             // has inverted if the current regime no longer matches the regime it was entered under.
             if (_openPosition != null && _entryRegime != null && _entryRegime != regime)
             {
                 CloseWithReason($"Regime flip - entered under {_entryRegime} gamma, now {regime} gamma (flip {_gamma.GammaFlip:F2} no longer holding) - premise for this trade has inverted", xBar.Close, xBar.OpenTime);
             }
+
+            // Wall-proximity exit management (take-profit-at-wall-touch / breakeven stop tighten) - runs
+            // regardless of what happens below, on whatever position is (still) open at this point.
+            ManageWallProximityExit(xBar);
 
             (string emaBias, string emaReason) = GetEmaTrendBias();
 
@@ -1322,52 +1439,66 @@ namespace cAlgo.Robots
                 return;
             }
 
-            if (positiveGamma)
-                TryFadeEntry(xBar, emaBias, regime);
-            else
+            // Both setups are evaluated every bar now - wall role (not regime) gates which one can actually
+            // fire (see the Strategy logic section of the file header). Fade checked first; if it opens a
+            // position, breakout is skipped for this bar (can't open two at once anyway).
+            TryFadeEntry(xBar, emaBias, regime);
+            if (_openPosition == null)
                 TryBreakoutEntry(xBar, emaBias, regime);
         }
 
-        // Positive gamma: fade toward the Gamma Flip, only with EMA agreement.
+        // Fade toward the Gamma Flip - only against a wall that is NOT Broken, only with EMA agreement.
+        // Natural regime is positive gamma (dampening); firing in negative gamma is still allowed but
+        // sized down via Off-Regime Risk Multiplier.
         private void TryFadeEntry(Bar xBar, string emaBias, string regime)
         {
             double distCallPct = Math.Abs(xBar.Close - _gamma.CallWall) / _gamma.CallWall * 100.0;
             double distPutPct = Math.Abs(xBar.Close - _gamma.PutWall) / _gamma.PutWall * 100.0;
 
+            bool isOffRegime = regime == "negative";
             DateTime localDate = TimeZoneInfo.ConvertTimeFromUtc(xBar.OpenTime, _sessionTz).Date;
-            double riskMult = GetConvictionRiskMultiplier(isFadeTrade: true, localDate);
+            double riskMult = GetConvictionRiskMultiplier(isFadeTrade: true, isOffRegime, localDate);
+            string regimeTag = isOffRegime ? "Off-regime (negative gamma) FADE" : "Positive gamma FADE";
 
-            if (emaBias == "short" && EnableShorts && distCallPct <= EntryProximityToWallPercent)
+            if (emaBias == "short" && EnableShorts && distCallPct <= EntryProximityToWallPercent && _callWallRole != WallRole.Broken)
             {
                 double stop = _gamma.CallWall * (1 + StopBufferPercent / 100.0);
                 double target = _gamma.GammaFlip;
                 if (!PassesRewardRisk(xBar.Close, stop, target, TradeType.Sell)) return;
 
-                string reason = $"Positive gamma FADE SHORT at Call Wall {_gamma.CallWall:F2} (within {distCallPct:F3}%), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})" + ConvictionSuffix(riskMult);
-                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime, riskMult);
+                string reason = $"{regimeTag} SHORT at Call Wall {_gamma.CallWall:F2} (within {distCallPct:F3}%, role={_callWallRole}), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime, riskMult, isFadeTrade: true);
             }
-            else if (emaBias == "long" && EnableLongs && distPutPct <= EntryProximityToWallPercent)
+            else if (emaBias == "long" && EnableLongs && distPutPct <= EntryProximityToWallPercent && _putWallRole != WallRole.Broken)
             {
                 double stop = _gamma.PutWall * (1 - StopBufferPercent / 100.0);
                 double target = _gamma.GammaFlip;
                 if (!PassesRewardRisk(xBar.Close, stop, target, TradeType.Buy)) return;
 
-                string reason = $"Positive gamma FADE LONG at Put Wall {_gamma.PutWall:F2} (within {distPutPct:F3}%), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})" + ConvictionSuffix(riskMult);
-                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime, riskMult);
+                string reason = $"{regimeTag} LONG at Put Wall {_gamma.PutWall:F2} (within {distPutPct:F3}%, role={_putWallRole}), target Gamma Flip {target:F2}, {emaBias.ToUpper()} EMA agrees ({emaReasonShort(emaBias)})" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime, riskMult, isFadeTrade: true);
             }
         }
 
-        // Negative gamma: trade the wall failing to hold (breakout continuation), only with EMA agreement.
+        // Trade the wall FAILING to hold (breakout continuation) - only against a wall that IS Broken, and
+        // (by default) was previously confirmed Holding before it broke. Only with EMA agreement. Natural
+        // regime is negative gamma (amplifying); firing in positive gamma is still allowed but sized down
+        // via Off-Regime Risk Multiplier, and does NOT get the negative-gamma stop-widen treatment.
         private void TryBreakoutEntry(Bar xBar, string emaBias, string regime)
         {
-            bool putWallBroke = xBar.Close < _gamma.PutWall * (1 - WallBreakBufferPercent / 100.0);
-            bool callWallBroke = xBar.Close > _gamma.CallWall * (1 + WallBreakBufferPercent / 100.0);
+            bool putWallBroke = _putWallRole == WallRole.Broken && (!RequireWallTestedBeforeBreakout || _putWallEverHeld);
+            bool callWallBroke = _callWallRole == WallRole.Broken && (!RequireWallTestedBeforeBreakout || _callWallEverHeld);
+
+            bool isOffRegime = regime == "positive";
+            string regimeTag = isOffRegime ? "Off-regime (positive gamma) BREAKOUT" : "Negative gamma BREAKOUT";
 
             // Negative gamma measured ~1.54x bigger next-day moves than positive gamma in real NDX data -
-            // widen the stop (and therefore the R:R-derived target) proportionally rather than sizing a
-            // breakout trade's risk the same as a calmer-regime trade.
-            double stopBuf = UseVolatilityConviction ? StopBufferPercent * NegativeGammaStopWidenFactor : StopBufferPercent;
-            double riskMult = GetConvictionRiskMultiplier(isFadeTrade: false, TimeZoneInfo.ConvertTimeFromUtc(xBar.OpenTime, _sessionTz).Date);
+            // widen the stop (and therefore the R:R-derived target) only when the trade is actually firing
+            // IN negative gamma, not just because Use Volatility Conviction is on generally.
+            bool applyWiden = UseVolatilityConviction && regime == "negative";
+            double stopBuf = applyWiden ? StopBufferPercent * NegativeGammaStopWidenFactor : StopBufferPercent;
+            double riskMult = GetConvictionRiskMultiplier(isFadeTrade: false, isOffRegime, TimeZoneInfo.ConvertTimeFromUtc(xBar.OpenTime, _sessionTz).Date);
+            string widenNote = applyWiden ? $", stop widened {NegativeGammaStopWidenFactor:F2}x" : "";
 
             if (emaBias == "short" && EnableShorts && putWallBroke)
             {
@@ -1375,8 +1506,8 @@ namespace cAlgo.Robots
                 double stopDist = stop - xBar.Close;
                 double target = xBar.Close - stopDist * BreakoutRewardToRiskRatio;
 
-                string reason = $"Negative gamma BREAKDOWN SHORT - Put Wall {_gamma.PutWall:F2} failed to hold, target {target:F2} ({BreakoutRewardToRiskRatio:F1}R, stop widened {NegativeGammaStopWidenFactor:F2}x), {emaBias.ToUpper()} EMA agrees" + ConvictionSuffix(riskMult);
-                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime, riskMult);
+                string reason = $"{regimeTag} SHORT - Put Wall {_gamma.PutWall:F2} failed to hold (everHeld={_putWallEverHeld}), target {target:F2} ({BreakoutRewardToRiskRatio:F1}R{widenNote}), {emaBias.ToUpper()} EMA agrees" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Sell, xBar, reason, stop, target, regime, riskMult, isFadeTrade: false);
             }
             else if (emaBias == "long" && EnableLongs && callWallBroke)
             {
@@ -1384,9 +1515,55 @@ namespace cAlgo.Robots
                 double stopDist = xBar.Close - stop;
                 double target = xBar.Close + stopDist * BreakoutRewardToRiskRatio;
 
-                string reason = $"Negative gamma BREAKOUT LONG - Call Wall {_gamma.CallWall:F2} failed to hold, target {target:F2} ({BreakoutRewardToRiskRatio:F1}R, stop widened {NegativeGammaStopWidenFactor:F2}x), {emaBias.ToUpper()} EMA agrees" + ConvictionSuffix(riskMult);
-                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime, riskMult);
+                string reason = $"{regimeTag} LONG - Call Wall {_gamma.CallWall:F2} failed to hold (everHeld={_callWallEverHeld}), target {target:F2} ({BreakoutRewardToRiskRatio:F1}R{widenNote}), {emaBias.ToUpper()} EMA agrees" + ConvictionSuffix(riskMult);
+                OpenPosition(TradeType.Buy, xBar, reason, stop, target, regime, riskMult, isFadeTrade: false);
             }
+        }
+
+        // Take-profit-at-wall-touch and breakeven-stop-tighten, both keyed off the wall AHEAD of the open
+        // position in its favorable direction (Call Wall for longs, Put Wall for shorts).
+        //
+        // FADE TRADES ONLY: a fade enters AT one wall (e.g. long at the Put Wall) with the OPPOSITE wall
+        // (Call Wall) still genuinely ahead and unreached - that's a real, known level to manage the exit
+        // against. A BREAKOUT trade enters having just closed BEYOND its wall (e.g. long above a broken
+        // Call Wall) - the "favorable" wall by this same isLong/isShort mapping would be that same Call
+        // Wall, which price has already passed, so "wait for price to reach it" would fire instantly at
+        // entry. There's no known next wall ahead of a breakout trade (see TryBreakoutEntry's R:R-based
+        // target for why), so this is intentionally skipped for breakout trades rather than applied wrong.
+        private void ManageWallProximityExit(Bar xBar)
+        {
+            if (_openPosition == null) return;
+            if (!_entryIsFadeTrade) return;
+            if (!TakeProfitAtWallTouch && WallProximityStopTightenPercent <= 0) return;
+            if (!_gamma.IsValid) return;
+
+            bool isLong = _openPosition.TradeType == TradeType.Buy;
+            double favorableWall = isLong ? _gamma.CallWall : _gamma.PutWall;
+            if (double.IsNaN(favorableWall) || favorableWall <= 0) return;
+
+            bool reachedWall = isLong ? xBar.Close >= favorableWall : xBar.Close <= favorableWall;
+            if (TakeProfitAtWallTouch && reachedWall)
+            {
+                CloseWithReason($"Take profit - price reached {(isLong ? "Call" : "Put")} Wall {favorableWall:F2} (close {xBar.Close:F2})", xBar.Close, xBar.OpenTime);
+                return;
+            }
+
+            if (WallProximityStopTightenPercent <= 0) return;
+
+            double distPct = Math.Abs(xBar.Close - favorableWall) / favorableWall * 100.0;
+            if (distPct > WallProximityStopTightenPercent) return;
+
+            bool inProfit = isLong ? xBar.Close > _entryPrice : xBar.Close < _entryPrice;
+            if (!inProfit) return;
+
+            double? currentStop = _openPosition.StopLoss;
+            bool shouldTighten = currentStop == null
+                || (isLong && currentStop.Value < _entryPrice)
+                || (!isLong && currentStop.Value > _entryPrice);
+            if (!shouldTighten) return;
+
+            _openPosition.ModifyStopLossPrice(_entryPrice);
+            Print($"[WALL] Tightened stop to breakeven ({_entryPrice:F2}) - price within {WallProximityStopTightenPercent:F2}% of favorable {(isLong ? "Call" : "Put")} Wall {favorableWall:F2}.");
         }
 
         private string ConvictionSuffix(double riskMult) => Math.Abs(riskMult - 1.0) > 0.001 ? $" [conviction risk x{riskMult:F2}]" : "";
@@ -1411,7 +1588,7 @@ namespace cAlgo.Robots
         // Position management
         // ---------------------------------------------------------------------------------------------
 
-        private void OpenPosition(TradeType type, Bar xBar, string reason, double stopPrice, double targetPrice, string regime, double riskMultiplier = 1.0)
+        private void OpenPosition(TradeType type, Bar xBar, string reason, double stopPrice, double targetPrice, string regime, double riskMultiplier, bool isFadeTrade)
         {
             double estEntry = type == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
             double stopDistance = Math.Abs(estEntry - stopPrice);
@@ -1429,6 +1606,7 @@ namespace cAlgo.Robots
             _openPosition = result.Position;
             _entryPrice = result.Position.EntryPrice;
             _entryRegime = regime;
+            _entryIsFadeTrade = isFadeTrade;
 
             _openPosition.ModifyStopLossPrice(stopPrice);
             _openPosition.ModifyTakeProfitPrice(targetPrice);
